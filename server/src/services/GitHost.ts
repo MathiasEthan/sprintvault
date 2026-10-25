@@ -1,101 +1,170 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { GitFileItem, GitGraphNode, GitMetadata } from '../types';
 
+// Field / record separators for machine-readable git output (never appear in commit text)
+const FS = '\x1f';
+const RS = '\x1e';
+
 export class GitHost {
-  private static defaultServiceUser = {
+  public static serviceUser = {
     name: 'SprintVault Service',
     email: 'service@sprintvault.local',
   };
 
   /**
-   * Initializes or verifies a Git repository at repoPath.
+   * Runs git without a shell (arguments are never interpreted by cmd.exe / sh).
+   */
+  static run(cwd: string, args: string[], input?: string): string {
+    try {
+      return execFileSync('git', args, {
+        cwd,
+        input,
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024 * 1024,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: '0',
+          GIT_COMMITTER_NAME: this.serviceUser.name,
+          GIT_COMMITTER_EMAIL: this.serviceUser.email,
+        },
+      });
+    } catch (err: any) {
+      const stderr = err.stderr ? String(err.stderr).trim() : '';
+      throw new Error(stderr || err.message);
+    }
+  }
+
+  /** Runs git and reports only success/failure (for --quiet / --is-ancestor style checks). */
+  static check(cwd: string, args: string[]): boolean {
+    try {
+      this.run(cwd, args);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  static isRepo(repoPath: string): boolean {
+    return fs.existsSync(path.join(repoPath, '.git'));
+  }
+
+  static isBareRepo(repoPath: string): boolean {
+    return (
+      fs.existsSync(path.join(repoPath, 'HEAD')) &&
+      fs.existsSync(path.join(repoPath, 'objects')) &&
+      !fs.existsSync(path.join(repoPath, '.git'))
+    );
+  }
+
+  static isValidBranchName(name: string): boolean {
+    if (!name || name.startsWith('-')) return false;
+    return this.check(process.cwd(), ['check-ref-format', '--branch', name]);
+  }
+
+  static hasCommits(repoPath: string): boolean {
+    return this.isRepo(repoPath) && this.check(repoPath, ['rev-parse', '--verify', '--quiet', 'HEAD']);
+  }
+
+  /**
+   * Initializes a repository at repoPath and makes the first commit from whatever is in the directory
+   * (plus optional starter files). Existing files are never overwritten.
+   */
+  static initRepo(repoPath: string, defaultBranch: string, initialFiles: { path: string; content: string }[] = []): void {
+    fs.mkdirSync(repoPath, { recursive: true });
+    this.run(repoPath, ['init', '-b', defaultBranch]);
+    this.run(repoPath, ['config', 'user.name', this.serviceUser.name]);
+    this.run(repoPath, ['config', 'user.email', this.serviceUser.email]);
+    this.run(repoPath, ['config', 'core.autocrlf', 'false']);
+
+    for (const item of initialFiles) {
+      const fullPath = path.join(repoPath, item.path);
+      if (fs.existsSync(fullPath)) continue;
+      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+      fs.writeFileSync(fullPath, item.content, 'utf8');
+    }
+
+    this.run(repoPath, ['add', '-A']);
+    this.run(repoPath, ['commit', '--allow-empty', '-m', 'chore: initial repository structure']);
+  }
+
+  /**
+   * Initializes a repository only if none exists yet.
    */
   static ensureRepo(
     repoPath: string,
     defaultBranch: string = 'main',
     initialFiles?: { path: string; content: string }[]
   ): void {
-    if (!fs.existsSync(repoPath)) {
-      fs.mkdirSync(repoPath, { recursive: true });
+    if (!this.isRepo(repoPath)) {
+      this.initRepo(repoPath, defaultBranch, initialFiles);
     }
+  }
 
-    const gitDir = path.join(repoPath, '.git');
-    if (!fs.existsSync(gitDir)) {
-      execSync(`git init -b "${defaultBranch}"`, { cwd: repoPath });
-      execSync(`git config user.name "${this.defaultServiceUser.name}"`, { cwd: repoPath });
-      execSync(`git config user.email "${this.defaultServiceUser.email}"`, { cwd: repoPath });
+  static clone(remoteUrl: string, repoPath: string, branch: string): void {
+    fs.mkdirSync(path.dirname(repoPath), { recursive: true });
+    this.run(path.dirname(repoPath), ['clone', '--branch', branch, '--', remoteUrl, repoPath]);
+    this.run(repoPath, ['config', 'user.name', this.serviceUser.name]);
+    this.run(repoPath, ['config', 'user.email', this.serviceUser.email]);
+    this.run(repoPath, ['config', 'core.autocrlf', 'false']);
+  }
 
-      // Add starter files if provided
-      const filesToCreate = initialFiles && initialFiles.length > 0 ? initialFiles : [
-        { path: 'README.md', content: `# Project Repository\n\nManaged by SprintVault.\n` }
-      ];
-
-      for (const item of filesToCreate) {
-        const fullPath = path.join(repoPath, item.path);
-        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-        fs.writeFileSync(fullPath, item.content, 'utf8');
-      }
-
-      execSync('git add -A', { cwd: repoPath });
-      execSync('git commit -m "chore: initial repository structure"', { cwd: repoPath });
+  static remoteHasBranch(remoteUrl: string, branch: string): boolean {
+    try {
+      return this.run(process.cwd(), ['ls-remote', '--heads', '--', remoteUrl, branch]).trim().length > 0;
+    } catch {
+      return false;
     }
   }
 
   /**
-   * readTree(branch): reads files from the Git repository tree.
+   * readTree(branch): reads every file of the branch tree with one batched cat-file call.
    */
   static readTree(branch: string, repoPath: string): GitFileItem[] {
-    this.ensureRepo(repoPath, branch);
-
-    try {
-      const output = execSync(`git ls-tree -r --name-only "${branch}"`, {
-        cwd: repoPath,
-        encoding: 'utf8',
-      }).trim();
-
-      if (!output) {
-        return [];
-      }
-
-      const filePaths = output.split('\n').filter(Boolean);
-      const items: GitFileItem[] = [];
-
-      for (const relPath of filePaths) {
-        try {
-          const content = execSync(`git show "${branch}:${relPath}"`, {
-            cwd: repoPath,
-            encoding: 'utf8',
-            maxBuffer: 10 * 1024 * 1024,
-          });
-          items.push({
-            path: relPath,
-            content,
-            size: Buffer.byteLength(content, 'utf8'),
-          });
-        } catch {
-          const fullPath = path.join(repoPath, relPath);
-          if (fs.existsSync(fullPath)) {
-            const content = fs.readFileSync(fullPath, 'utf8');
-            items.push({
-              path: relPath,
-              content,
-              size: Buffer.byteLength(content, 'utf8'),
-            });
-          }
-        }
-      }
-
-      return items;
-    } catch (err) {
-      console.error('GitHost.readTree error:', err);
+    if (!this.hasCommits(repoPath)) {
       return [];
     }
+    if (!this.isValidBranchName(branch) || !this.check(repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])) {
+      throw new Error(`Branch '${branch}' not found`);
+    }
+
+    const listing = this.run(repoPath, ['ls-tree', '-r', '-z', `refs/heads/${branch}`]);
+    const entries = listing
+      .split('\0')
+      .filter(Boolean)
+      .map((line) => {
+        const tab = line.indexOf('\t');
+        const [, type, sha] = line.slice(0, tab).split(' ');
+        return { type, sha, path: line.slice(tab + 1) };
+      })
+      .filter((e) => e.type === 'blob');
+
+    if (entries.length === 0) return [];
+
+    const raw = execFileSync('git', ['cat-file', '--batch'], {
+      cwd: repoPath,
+      input: entries.map((e) => e.sha).join('\n') + '\n',
+      maxBuffer: 256 * 1024 * 1024,
+    });
+
+    const items: GitFileItem[] = [];
+    let offset = 0;
+    for (const entry of entries) {
+      const headerEnd = raw.indexOf(0x0a, offset);
+      const header = raw.subarray(offset, headerEnd).toString('utf8');
+      const size = parseInt(header.split(' ')[2], 10);
+      const content = raw.subarray(headerEnd + 1, headerEnd + 1 + size).toString('utf8');
+      offset = headerEnd + 1 + size + 1;
+      items.push({ path: entry.path, content, size });
+    }
+    return items;
   }
 
   /**
-   * push(commit): Commits changes using the service account and returns the commit SHA.
+   * push(commit): writes the given files, stages only those files, commits as the developer
+   * (committer = service account) and returns the commit SHA. Throws if nothing changed.
    */
   static push(commitData: {
     repoPath: string;
@@ -105,13 +174,7 @@ export class GitHost {
     author: { name: string; email: string };
   }): string {
     const { repoPath, branch, files, msg, author } = commitData;
-    this.ensureRepo(repoPath, branch);
-
-    try {
-      execSync(`git checkout "${branch}"`, { cwd: repoPath, stdio: 'ignore' });
-    } catch {
-      execSync(`git checkout -B "${branch}"`, { cwd: repoPath, stdio: 'ignore' });
-    }
+    this.checkoutBranch(repoPath, branch);
 
     for (const item of files) {
       const fullPath = path.join(repoPath, item.path);
@@ -119,28 +182,154 @@ export class GitHost {
       fs.writeFileSync(fullPath, item.content, 'utf8');
     }
 
-    execSync('git add -A', { cwd: repoPath });
-
-    const status = execSync('git status --porcelain', { cwd: repoPath, encoding: 'utf8' }).trim();
-    if (!status) {
-      const headSha = execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf8' }).trim();
-      return headSha;
+    const paths = files.map((f) => f.path);
+    this.run(repoPath, ['add', '--', ...paths]);
+    if (this.check(repoPath, ['diff', '--cached', '--quiet', '--', ...paths])) {
+      throw new Error('No changes to commit: pushed files are identical to the repository');
     }
+    return this.commit(repoPath, msg, author, paths);
+  }
 
-    const authorArg = `--author="${author.name.replace(/"/g, '\\"')} <${author.email.replace(/"/g, '\\')}>"`;
-    const escapedMsg = msg.replace(/"/g, '\\"');
+  /**
+   * Commits pending working-tree changes limited to the given pathspecs (never .scrum.json).
+   */
+  static commitPaths(
+    repoPath: string,
+    pathspecs: string[],
+    author: { name: string; email: string },
+    msg: string
+  ): string {
+    // Skip scope paths that neither exist on disk nor are tracked (git rejects unmatched pathspecs)
+    const present = pathspecs.filter(
+      (p) => p === '.' || fs.existsSync(path.join(repoPath, p)) || this.run(repoPath, ['ls-files', '--', p]).trim() !== ''
+    );
+    if (present.length === 0) {
+      throw new Error('No pending changes inside the task scope');
+    }
+    const specs = [...present, ':(exclude).scrum.json'];
+    this.run(repoPath, ['add', '-A', '--', ...specs]);
+    if (this.check(repoPath, ['diff', '--cached', '--quiet', '--', ...specs])) {
+      throw new Error('No pending changes inside the task scope');
+    }
+    return this.commit(repoPath, msg, author, specs);
+  }
 
-    execSync(`git commit -m "${escapedMsg}" ${authorArg}`, {
-      cwd: repoPath,
-      env: {
-        ...process.env,
-        GIT_COMMITTER_NAME: this.defaultServiceUser.name,
-        GIT_COMMITTER_EMAIL: this.defaultServiceUser.email,
-      },
-    });
+  /**
+   * Commits .scrum.json (and nothing else) as the service account. Returns null when unchanged.
+   */
+  static commitScrumFile(repoPath: string, msg: string): string | null {
+    if (!this.hasCommits(repoPath)) return null;
+    this.run(repoPath, ['add', '--', '.scrum.json']);
+    if (this.check(repoPath, ['diff', '--cached', '--quiet', '--', '.scrum.json'])) {
+      return null;
+    }
+    return this.commit(repoPath, msg, this.serviceUser, ['.scrum.json']);
+  }
 
-    const sha = execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf8' }).trim();
-    return sha;
+  private static commit(repoPath: string, msg: string, author: { name: string; email: string }, pathspecs: string[]): string {
+    // -F - reads the message from stdin: multi-line safe, never touches a shell
+    this.run(repoPath, ['commit', '-F', '-', `--author=${author.name} <${author.email}>`, '--', ...pathspecs], msg);
+    return this.run(repoPath, ['rev-parse', 'HEAD']).trim();
+  }
+
+  /**
+   * Undoes the last commit (used when publishing a push fails) and restores the given files.
+   */
+  static rollbackLastCommit(repoPath: string, paths: string[]): void {
+    this.run(repoPath, ['reset', '--soft', 'HEAD~1']);
+    for (const p of paths) {
+      if (this.check(repoPath, ['cat-file', '-e', `HEAD:${p}`])) {
+        this.run(repoPath, ['restore', '--staged', '--worktree', '--source=HEAD', '--', p]);
+      } else {
+        this.run(repoPath, ['rm', '--cached', '--quiet', '--', p]);
+        fs.rmSync(path.join(repoPath, p), { force: true });
+      }
+    }
+  }
+
+  private static checkoutBranch(repoPath: string, branch: string): void {
+    const current = this.run(repoPath, ['symbolic-ref', '--short', 'HEAD']).trim();
+    if (current !== branch) {
+      this.run(repoPath, ['checkout', branch]);
+    }
+  }
+
+  // ---------- Remote (origin) ----------
+
+  static getRemoteUrl(repoPath: string): string | null {
+    if (!this.isRepo(repoPath)) return null;
+    try {
+      return this.run(repoPath, ['config', '--get', 'remote.origin.url']).trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  static setRemote(repoPath: string, url: string): void {
+    if (this.getRemoteUrl(repoPath)) {
+      this.run(repoPath, ['remote', 'set-url', 'origin', url]);
+    } else {
+      this.run(repoPath, ['remote', 'add', 'origin', url]);
+    }
+  }
+
+  /**
+   * Brings commits pushed by developers from their own machines into the service repository.
+   */
+  static syncFromRemote(repoPath: string, branch: string): boolean {
+    if (!this.getRemoteUrl(repoPath)) return false;
+    this.run(repoPath, ['fetch', '--quiet', 'origin']);
+    if (!this.check(repoPath, ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`])) {
+      return true;
+    }
+    this.checkoutBranch(repoPath, branch);
+    if (!this.check(repoPath, ['merge', '--ff-only', '--quiet', `origin/${branch}`])) {
+      // Local has unpublished service commits (.scrum.json) and remote moved on: replay ours on top
+      try {
+        this.run(repoPath, ['rebase', '--autostash', `origin/${branch}`]);
+      } catch (err) {
+        this.check(repoPath, ['rebase', '--abort']);
+        throw err;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Publishes the branch to origin. Returns false when the project has no remote.
+   */
+  static publish(repoPath: string, branch: string): boolean {
+    if (!this.getRemoteUrl(repoPath)) return false;
+    try {
+      this.run(repoPath, ['push', '--quiet', '-u', 'origin', branch]);
+    } catch {
+      this.syncFromRemote(repoPath, branch);
+      this.run(repoPath, ['push', '--quiet', '-u', 'origin', branch]);
+    }
+    return true;
+  }
+
+  // ---------- Commit inspection ----------
+
+  static resolveCommit(repoPath: string, ref: string): string | null {
+    if (!this.hasCommits(repoPath) || !/^[0-9a-fA-F]{4,40}$/.test(ref)) return null;
+    try {
+      return this.run(repoPath, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).trim();
+    } catch {
+      return null;
+    }
+  }
+
+  static isAncestor(repoPath: string, sha: string, ref: string): boolean {
+    return this.check(repoPath, ['merge-base', '--is-ancestor', sha, ref]);
+  }
+
+  static getCommitAuthorEmail(repoPath: string, sha: string): string {
+    return this.run(repoPath, ['show', '-s', '--format=%ae', sha]).trim();
+  }
+
+  static getCommitTime(repoPath: string, sha: string): number {
+    return parseInt(this.run(repoPath, ['show', '-s', '--format=%ct', sha]).trim(), 10);
   }
 
   /**
@@ -153,71 +342,25 @@ export class GitHost {
     authorEmail: string;
     date: string;
   }> {
-    this.ensureRepo(repoPath);
-    try {
-      const format = '%H|%s|%an|%ae|%ad';
-      const output = execSync(`git log -n ${limit} --format="${format}" --date=iso`, {
-        cwd: repoPath,
-        encoding: 'utf8',
-      }).trim();
-
-      if (!output) return [];
-
-      return output.split('\n').filter(Boolean).map((line) => {
-        const [sha, message, authorName, authorEmail, date] = line.split('|');
+    if (!this.hasCommits(repoPath)) return [];
+    const output = this.run(repoPath, ['log', '-n', String(limit), `--format=%H${FS}%s${FS}%an${FS}%ae${FS}%ad${RS}`, '--date=iso']);
+    return output
+      .split(RS)
+      .map((r) => r.trim())
+      .filter(Boolean)
+      .map((record) => {
+        const [sha, message, authorName, authorEmail, date] = record.split(FS);
         return { sha, message, authorName, authorEmail, date };
       });
-    } catch {
-      return [];
-    }
   }
 
   /**
    * Returns latest commit (HEAD) in the repository.
    */
   static getLatestCommit(repoPath: string): { sha: string; message: string; author: string; date: string } | null {
-    this.ensureRepo(repoPath);
-    try {
-      const output = execSync('git log -1 --format="%H|%s|%an|%ad" --date=iso', {
-        cwd: repoPath,
-        encoding: 'utf8',
-      }).trim();
-      if (!output) return null;
-      const [sha, message, author, date] = output.split('|');
-      return { sha, message, author, date };
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Commits pending local changes made by developer on disk.
-   */
-  static commitPendingChanges(
-    repoPath: string,
-    author: { name: string; email: string },
-    msg: string
-  ): string {
-    this.ensureRepo(repoPath);
-    execSync('git add -A', { cwd: repoPath });
-    const status = execSync('git status --porcelain', { cwd: repoPath, encoding: 'utf8' }).trim();
-    if (!status) {
-      return execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf8' }).trim();
-    }
-
-    const authorArg = `--author="${author.name.replace(/"/g, '\\"')} <${author.email.replace(/"/g, '\\')}>"`;
-    const escapedMsg = msg.replace(/"/g, '\\"');
-
-    execSync(`git commit -m "${escapedMsg}" ${authorArg}`, {
-      cwd: repoPath,
-      env: {
-        ...process.env,
-        GIT_COMMITTER_NAME: this.defaultServiceUser.name,
-        GIT_COMMITTER_EMAIL: this.defaultServiceUser.email,
-      },
-    });
-
-    return execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf8' }).trim();
+    const [latest] = this.getLog(repoPath, 1);
+    if (!latest) return null;
+    return { sha: latest.sha, message: latest.message, author: latest.authorName, date: latest.date };
   }
 
   /**
@@ -227,84 +370,61 @@ export class GitHost {
     nodes: GitGraphNode[];
     rawGraphText: string;
   } {
-    this.ensureRepo(repoPath);
-
-    try {
-      const rawGraphText = execSync(
-        `git log -n ${limit} --graph --all --date=format:"%Y-%m-%d %H:%M" --pretty=format:"%h %d %s (%an, %cd)"`,
-        { cwd: repoPath, encoding: 'utf8' }
-      ).trim();
-
-      const format = '%H|%P|%an|%ae|%ad|%s|%D';
-      const output = execSync(`git log -n ${limit} --all --format="${format}" --date=iso`, {
-        cwd: repoPath,
-        encoding: 'utf8',
-      }).trim();
-
-      if (!output) {
-        return { nodes: [], rawGraphText: '' };
-      }
-
-      const lines = output.split('\n').filter(Boolean);
-      const nodes: GitGraphNode[] = [];
-
-      for (const line of lines) {
-        const parts = line.split('|');
-        const sha = parts[0] || '';
-        const rawParents = parts[1] || '';
-        const authorName = parts[2] || '';
-        const authorEmail = parts[3] || '';
-        const date = parts[4] || '';
-        const message = parts[5] || '';
-        const refStr = parts[6] || '';
-
-        const parents = rawParents.split(' ').filter(Boolean);
-
-        const branches: string[] = [];
-        const tags: string[] = [];
-        let isHead = false;
-
-        if (refStr) {
-          const refItems = refStr.split(',').map((r) => r.trim());
-          for (const item of refItems) {
-            if (item.includes('HEAD')) {
-              isHead = true;
-              const match = item.match(/HEAD\s*->\s*([^\s,]+)/);
-              if (match) branches.push(match[1]);
-            } else if (item.startsWith('tag: ')) {
-              tags.push(item.replace('tag: ', ''));
-            } else if (!item.includes('/')) {
-              branches.push(item);
-            }
-          }
-        }
-
-        nodes.push({
-          sha,
-          shortSha: sha.substring(0, 7),
-          parents,
-          authorName,
-          authorEmail,
-          date,
-          message,
-          branches,
-          tags,
-          isHead,
-        });
-      }
-
-      return { nodes, rawGraphText };
-    } catch (err) {
-      console.error('GitHost.getCommitGraph error:', err);
+    if (!this.hasCommits(repoPath)) {
       return { nodes: [], rawGraphText: '' };
     }
+
+    const rawGraphText = this.run(repoPath, [
+      'log', '-n', String(limit), '--graph', '--all', '--date=format:%Y-%m-%d %H:%M', '--pretty=format:%h %d %s (%an, %cd)',
+    ]).trim();
+
+    const output = this.run(repoPath, [
+      'log', '-n', String(limit), '--all', `--format=%H${FS}%P${FS}%an${FS}%ae${FS}%ad${FS}%s${FS}%D${RS}`, '--date=iso',
+    ]);
+
+    const nodes: GitGraphNode[] = [];
+    for (const record of output.split(RS).map((r) => r.trim()).filter(Boolean)) {
+      const [sha = '', rawParents = '', authorName = '', authorEmail = '', date = '', message = '', refStr = ''] = record.split(FS);
+
+      const branches: string[] = [];
+      const tags: string[] = [];
+      let isHead = false;
+
+      if (refStr) {
+        for (const item of refStr.split(',').map((r) => r.trim())) {
+          if (item.includes('HEAD')) {
+            isHead = true;
+            const match = item.match(/HEAD\s*->\s*([^\s,]+)/);
+            if (match) branches.push(match[1]);
+          } else if (item.startsWith('tag: ')) {
+            tags.push(item.replace('tag: ', ''));
+          } else if (!item.includes('/')) {
+            branches.push(item);
+          }
+        }
+      }
+
+      nodes.push({
+        sha,
+        shortSha: sha.substring(0, 7),
+        parents: rawParents.split(' ').filter(Boolean),
+        authorName,
+        authorEmail,
+        date,
+        message,
+        branches,
+        tags,
+        isHead,
+      });
+    }
+
+    return { nodes, rawGraphText };
   }
 
   /**
-   * Reads .git directory metadata directly from the filesystem.
+   * Reads .git directory metadata directly from the filesystem (read-only: never creates a repo).
    */
   static getGitMetadata(repoPath: string): GitMetadata {
-    this.ensureRepo(repoPath);
     const gitDir = path.join(repoPath, '.git');
     const gitDirExists = fs.existsSync(gitDir);
 
@@ -315,6 +435,7 @@ export class GitHost {
     let config = '';
     let hasUncommittedChanges = false;
     let uncommittedFiles: string[] = [];
+    let totalCommits = 0;
 
     if (gitDirExists) {
       const headFile = path.join(gitDir, 'HEAD');
@@ -330,42 +451,23 @@ export class GitHost {
         config = fs.readFileSync(configFile, 'utf8');
       }
 
-      const headsDir = path.join(gitDir, 'refs', 'heads');
-      if (fs.existsSync(headsDir)) {
-        try {
-          branches = fs.readdirSync(headsDir);
-        } catch {
-          branches = [currentBranch];
-        }
+      try {
+        branches = this.run(repoPath, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']).split('\n').filter(Boolean);
+      } catch {
+        branches = [currentBranch];
       }
 
       try {
-        const statusOutput = execSync('git status --porcelain', {
-          cwd: repoPath,
-          encoding: 'utf8',
-        }).trim();
-
-        if (statusOutput) {
-          hasUncommittedChanges = true;
-          uncommittedFiles = statusOutput.split('\n').filter(Boolean);
-        }
+        uncommittedFiles = this.run(repoPath, ['status', '--porcelain']).split('\n').filter(Boolean);
+        hasUncommittedChanges = uncommittedFiles.length > 0;
       } catch {
         // Ignored
       }
-    }
 
-    let totalCommits = 0;
-    try {
-      const countStr = execSync('git rev-list --count --all', {
-        cwd: repoPath,
-        encoding: 'utf8',
-      }).trim();
-      totalCommits = parseInt(countStr, 10) || 0;
-    } catch {
-      totalCommits = 0;
+      if (this.hasCommits(repoPath)) {
+        totalCommits = parseInt(this.run(repoPath, ['rev-list', '--count', '--all']).trim(), 10) || 0;
+      }
     }
-
-    const scrumFileExists = fs.existsSync(path.join(repoPath, '.scrum.json'));
 
     return {
       gitDirExists,
@@ -377,7 +479,7 @@ export class GitHost {
       config,
       hasUncommittedChanges,
       uncommittedFiles,
-      scrumFileExists,
+      scrumFileExists: fs.existsSync(path.join(repoPath, '.scrum.json')),
     };
   }
 
@@ -385,18 +487,10 @@ export class GitHost {
    * Returns commit details and diff.
    */
   static getCommitDetails(repoPath: string, sha: string): { sha: string; diff: string; message: string } | null {
-    try {
-      const message = execSync(`git log -1 --format="%B" "${sha}"`, {
-        cwd: repoPath,
-        encoding: 'utf8',
-      }).trim();
-      const diff = execSync(`git show "${sha}" --stat --patch`, {
-        cwd: repoPath,
-        encoding: 'utf8',
-      });
-      return { sha, message, diff };
-    } catch {
-      return null;
-    }
+    const resolved = this.resolveCommit(repoPath, sha);
+    if (!resolved) return null;
+    const message = this.run(repoPath, ['log', '-1', '--format=%B', resolved]).trim();
+    const diff = this.run(repoPath, ['show', '--stat', '--patch', resolved]);
+    return { sha: resolved, message, diff };
   }
 }

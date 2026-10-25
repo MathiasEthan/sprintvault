@@ -4,7 +4,7 @@ import fs from 'fs';
 import bcrypt from 'bcryptjs';
 import { UserRole } from '../types';
 
-const DB_PATH = process.env.DB_PATH || path.resolve(process.cwd(), 'sprintvault.db');
+export const DB_PATH = process.env.DB_PATH || path.resolve(process.cwd(), 'sprintvault.db');
 export const db = new DatabaseSync(DB_PATH);
 
 // Enable WAL mode for better concurrency and foreign keys

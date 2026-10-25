@@ -1,10 +1,19 @@
 import { db } from '../db/database';
 import { FileLockRow, LockStatus } from '../types';
 
+function normalizePrefix(p: string): string {
+  return p
+    .trim()
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter((s) => s !== '' && s !== '.')
+    .join('/');
+}
+
 export function prefixOverlaps(p1: string, p2: string): boolean {
-  // Normalize by trimming slashes and whitespace
-  const norm1 = p1.trim().replace(/^\/+|\/+$/g, '');
-  const norm2 = p2.trim().replace(/^\/+|\/+$/g, '');
+  // Normalize separators, './' and duplicate/leading/trailing slashes
+  const norm1 = normalizePrefix(p1);
+  const norm2 = normalizePrefix(p2);
 
   // Root or empty matches everything
   if (norm1 === '' || norm2 === '') return true;

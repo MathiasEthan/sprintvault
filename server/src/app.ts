@@ -9,6 +9,8 @@ import gitRoutes from './routes/git.routes';
 import dashboardRoutes from './routes/dashboard.routes';
 import { initDatabase } from './db/database';
 import { seedInitialProject } from './db/seed';
+import { authenticate } from './middleware/auth';
+import { ChangeFeed } from './services/ChangeFeed';
 
 // Initialize DB schema and seed 5 users + initial project
 initDatabase();
@@ -26,6 +28,11 @@ app.use('/api/projects', projectsRoutes);
 app.use('/api/tasks', tasksRoutes);
 app.use('/api/git', gitRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+
+// Change marker: clients poll this and refresh their views when it moves
+app.get('/api/changes', authenticate, (req: Request, res: Response) => {
+  res.json({ version: ChangeFeed.current() });
+});
 
 // System health check
 app.get('/api/health', (req: Request, res: Response) => {
@@ -46,9 +53,15 @@ if (fs.existsSync(clientDist)) {
 
 // Global error handler
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Malformed JSON body' });
+  }
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).json({ error: 'Upload exceeds the 100MB limit' });
+  }
   console.error('Unhandled server error:', err);
   if (err.message === 'access denied') {
     return res.status(403).json({ error: 'access denied' });
   }
-  res.status(500).json({ error: err.message || 'Internal server error' });
+  res.status(500).json({ error: 'Internal server error' });
 });

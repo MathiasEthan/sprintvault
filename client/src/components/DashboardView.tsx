@@ -1,38 +1,35 @@
 import React, { useState, useEffect } from 'react';
-import { api } from '../api';
 import { useAuth } from '../context/AuthContext';
-import { UserRole, TaskStatus, ActionType } from '../types';
-import {
-  BarChart3,
-  GitCommit,
-  Download,
-  Lock,
-  Unlock,
-  Users,
-  CheckCircle2,
-  Clock,
-  ShieldAlert,
-  ArrowUpRight,
-  RefreshCw,
-  ExternalLink,
-} from 'lucide-react';
+import { api } from '../api';
+import { TaskStatus, UserRole, ActionType } from '../types';
+import { Button, Code, displayScope, PageHeader, Spinner } from './ui';
 
 interface DashboardViewProps {
-  onOpenCommitDetails: (sha: string) => void;
+  onOpenCommitDetails: (sha: string, projectId?: number | null) => void;
+  refreshKey?: number;
 }
 
-export const DashboardView: React.FC<DashboardViewProps> = ({ onOpenCommitDetails }) => {
+const STATES: { status: TaskStatus; label: string; bar: string }[] = [
+  { status: TaskStatus.CREATED, label: 'Backlog', bar: 'bg-slate-700' },
+  { status: TaskStatus.ASSIGNED, label: 'Assigned', bar: 'bg-slate-500' },
+  { status: TaskStatus.IN_PROGRESS, label: 'In progress', bar: 'bg-amber-400' },
+  { status: TaskStatus.COMPLETED, label: 'Done', bar: 'bg-blue-500' },
+];
+
+function when(iso: string): string {
+  return new Date(iso).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+export const DashboardView: React.FC<DashboardViewProps> = ({ onOpenCommitDetails, refreshKey }) => {
   const { currentUser } = useAuth();
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState<boolean>(true);
-
   const isManager = currentUser?.role === UserRole.MANAGER;
 
-  const loadDashboard = async () => {
-    setLoading(true);
+  const loadDashboard = async (background = false) => {
+    if (!background) setLoading(true);
     try {
-      const res = await api.getDashboard();
-      setData(res);
+      setData(await api.getDashboard());
     } catch (err) {
       console.error('Failed to load dashboard:', err);
     } finally {
@@ -44,255 +41,154 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ onOpenCommitDetail
     loadDashboard();
   }, [currentUser?.userId]);
 
-  if (loading || !data) {
-    return (
-      <div className="py-20 text-center text-slate-400 flex items-center justify-center space-x-2">
-        <RefreshCw className="w-5 h-5 animate-spin text-blue-400" />
-        <span>Loading Scrum metrics and audit logs...</span>
-      </div>
-    );
-  }
+  // Live refresh when someone changes the Scrum (no spinner)
+  useEffect(() => {
+    if (refreshKey) loadDashboard(true);
+  }, [refreshKey]);
+
+  if (loading || !data) return <Spinner label="Loading team activity…" />;
 
   const { tasks, developerStats, activeLocks, recentActivity } = data;
+  const total = tasks.length;
 
-  const completedCount = tasks.filter((t: any) => t.status === TaskStatus.COMPLETED).length;
-  const inProgressCount = tasks.filter((t: any) => t.status === TaskStatus.IN_PROGRESS).length;
+  const describe = (log: any) => {
+    const who = log.user_id === currentUser?.userId ? 'You' : log.user_name;
+    switch (log.action) {
+      case ActionType.LOCK:
+        return <>{who} started task #{log.ref} and locked its scope</>;
+      case ActionType.PULL:
+        return <>{who} downloaded files from project #{log.ref}</>;
+      case ActionType.FORCE_UNLOCK:
+        return <>{who} released the lock on task #{log.ref}</>;
+      case ActionType.PUSH:
+        return (
+          <>
+            {who} finished a task in{' '}
+            <button
+              onClick={() => onOpenCommitDetails(log.ref, log.project_id)}
+              className="font-mono text-[12px] text-blue-300 underline decoration-slate-600 underline-offset-2 hover:decoration-blue-300"
+            >
+              {String(log.ref).substring(0, 7)}
+            </button>
+          </>
+        );
+      default:
+        return <>{who}: {log.action}</>;
+    }
+  };
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="bg-slate-900/80 p-4 rounded-xl border border-slate-800 flex items-center justify-between">
-        <div>
-          <h2 className="text-lg font-bold text-white flex items-center gap-2">
-            <BarChart3 className="w-5 h-5 text-blue-400" />
-            <span>{isManager ? 'Team Scrum Metrics & Audit' : 'Personal Scrum Stats'}</span>
-          </h2>
-          <p className="text-xs text-slate-400 mt-0.5">
-            {isManager
-              ? 'Complete overview of all 4 developers, active scopes, Git commits, and audit logs.'
-              : 'Your individual productivity counters, active locks, and recent actions.'}
-          </p>
-        </div>
+    <div>
+      <PageHeader
+        title={isManager ? 'Team' : 'Your work'}
+        meta={<span>{total === 0 ? 'No tasks yet.' : `${total} ${total === 1 ? 'task' : 'tasks'} across all projects`}</span>}
+        actions={<Button onClick={() => loadDashboard()}>Refresh</Button>}
+      />
 
-        <button
-          onClick={loadDashboard}
-          className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg border border-slate-700 transition"
-          title="Refresh metrics"
-        >
-          <RefreshCw className="w-4 h-4" />
-        </button>
-      </div>
-
-      {/* Metric Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div className="bg-slate-900/60 p-4 rounded-xl border border-slate-800">
-          <span className="text-[11px] uppercase font-bold text-slate-400 block mb-1">
-            Total Tasks
-          </span>
-          <div className="text-2xl font-bold text-white">{tasks.length}</div>
-        </div>
-
-        <div className="bg-slate-900/60 p-4 rounded-xl border border-slate-800">
-          <span className="text-[11px] uppercase font-bold text-emerald-400 block mb-1">
-            Completed Tasks
-          </span>
-          <div className="text-2xl font-bold text-emerald-300">{completedCount}</div>
-        </div>
-
-        <div className="bg-slate-900/60 p-4 rounded-xl border border-slate-800">
-          <span className="text-[11px] uppercase font-bold text-amber-400 block mb-1">
-            Active Locks
-          </span>
-          <div className="text-2xl font-bold text-amber-300">{activeLocks.length}</div>
-        </div>
-
-        <div className="bg-slate-900/60 p-4 rounded-xl border border-slate-800">
-          <span className="text-[11px] uppercase font-bold text-blue-400 block mb-1">
-            In Progress
-          </span>
-          <div className="text-2xl font-bold text-blue-300">{inProgressCount}</div>
-        </div>
-      </div>
-
-      {/* Developer Stats Table */}
-      <div className="bg-slate-900/70 rounded-xl border border-slate-800 overflow-hidden">
-        <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-          <h3 className="text-sm font-bold text-white flex items-center gap-2">
-            <Users className="w-4 h-4 text-blue-400" />
-            <span>Developer Productivity Counters (Section 5)</span>
-          </h3>
-          <span className="text-xs text-slate-500">Pushes, pulls & task completions per developer</span>
-        </div>
-
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="bg-slate-800/60 text-slate-400 uppercase text-[10px] font-semibold border-b border-slate-800">
-              <tr>
-                <th className="px-4 py-3">Developer</th>
-                <th className="px-4 py-3 text-center">Git Pushes</th>
-                <th className="px-4 py-3 text-center">Git Pulls</th>
-                <th className="px-4 py-3 text-center">Tasks Completed</th>
-                <th className="px-4 py-3 text-right">Last Activity</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800 text-slate-300">
-              {developerStats.map((stat: any) => (
-                <tr key={stat.user_id} className="hover:bg-slate-800/40 transition">
-                  <td className="px-4 py-3 font-medium text-white">
-                    <div>{stat.name}</div>
-                    <div className="text-[10px] text-slate-400 font-normal">{stat.email}</div>
-                  </td>
-                  <td className="px-4 py-3 text-center">
-                    <span className="font-mono bg-blue-950/70 text-blue-300 px-2.5 py-0.5 rounded-full border border-blue-800/60 font-semibold">
-                      {stat.push_count}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-center">
-                    <span className="font-mono bg-purple-950/70 text-purple-300 px-2.5 py-0.5 rounded-full border border-purple-800/60 font-semibold">
-                      {stat.pull_count}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-center">
-                    <span className="font-mono bg-emerald-950/70 text-emerald-300 px-2.5 py-0.5 rounded-full border border-emerald-800/60 font-semibold">
-                      {stat.tasks_completed}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-right text-slate-400">
-                    {stat.last_activity_at ? (
-                      <span className="text-[11px]">{new Date(stat.last_activity_at).toLocaleString()}</span>
-                    ) : (
-                      <span className="text-slate-500 italic">None</span>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Active Locks Monitor */}
-      <div className="bg-slate-900/70 rounded-xl border border-slate-800 overflow-hidden">
-        <div className="p-4 border-b border-slate-800">
-          <h3 className="text-sm font-bold text-white flex items-center gap-2">
-            <Lock className="w-4 h-4 text-amber-400" />
-            <span>Active Exclusive File Locks</span>
-          </h3>
-        </div>
-
-        {activeLocks.length === 0 ? (
-          <div className="p-6 text-center text-slate-500 text-xs italic">
-            No active file locks currently held. Repository scopes are free for assignment.
-          </div>
-        ) : (
-          <div className="divide-y divide-slate-800">
-            {activeLocks.map((lock: any) => {
-              let scopeList: string[] = [];
-              try {
-                scopeList = JSON.parse(lock.scope_paths);
-              } catch {
-                scopeList = [];
-              }
-
-              return (
-                <div key={lock.lock_id} className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-                  <div>
-                    <div className="flex items-center space-x-2">
-                      <span className="font-mono font-bold text-amber-400">Lock #{lock.lock_id}</span>
-                      <span className="text-slate-400">on Task #{lock.task_id}:</span>
-                      <span className="font-medium text-white">{lock.task_title}</span>
-                    </div>
-                    <div className="flex items-center space-x-2 mt-1">
-                      <span className="text-slate-400">Locked Prefixes:</span>
-                      <div className="flex gap-1">
-                        {scopeList.map((p, i) => (
-                          <span key={i} className="font-mono bg-slate-800 text-blue-300 px-1.5 py-0.5 rounded border border-slate-700">
-                            {p}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="text-right text-slate-400">
-                    <div>
-                      Owner: <span className="text-white font-medium">{lock.owner_name}</span>
-                    </div>
-                    <div className="text-[10px] text-slate-500">
-                      Acquired: {new Date(lock.acquired_at).toLocaleString()}
-                    </div>
-                  </div>
-                </div>
-              );
+      {/* Where the work is: one proportional bar instead of stat tiles */}
+      {total > 0 && (
+        <section aria-label="Task states" className="mb-10">
+          <div className="flex h-2 overflow-hidden rounded-sm bg-slate-900">
+            {STATES.map((s) => {
+              const n = tasks.filter((t: any) => t.status === s.status).length;
+              return n ? <div key={s.status} className={s.bar} style={{ width: `${(n / total) * 100}%` }} /> : null;
             })}
           </div>
-        )}
-      </div>
+          <dl className="mt-3 flex flex-wrap gap-x-8 gap-y-2 text-sm">
+            {STATES.map((s) => (
+              <div key={s.status} className="flex items-center gap-2">
+                <span className={`h-2 w-2 rounded-sm ${s.bar}`} />
+                <dt className="text-slate-400">{s.label}</dt>
+                <dd className="tabular font-semibold text-slate-100">{tasks.filter((t: any) => t.status === s.status).length}</dd>
+              </div>
+            ))}
+          </dl>
+        </section>
+      )}
 
-      {/* Activity Log Audit Timeline */}
-      <div className="bg-slate-900/70 rounded-xl border border-slate-800 overflow-hidden">
-        <div className="p-4 border-b border-slate-800">
-          <h3 className="text-sm font-bold text-white flex items-center gap-2">
-            <Clock className="w-4 h-4 text-purple-400" />
-            <span>Activity Audit Log (Section 4 & 5)</span>
-          </h3>
-        </div>
+      <div className="grid gap-10 lg:grid-cols-5">
+        <div className="space-y-10 lg:col-span-3">
+          <section>
+            <h2 className="mb-3 text-base font-semibold text-slate-100">Locked code</h2>
+            {activeLocks.length === 0 ? (
+              <p className="text-sm text-slate-500">Nobody holds a lock. Every scope is free to start.</p>
+            ) : (
+              <ul className="divide-y divide-slate-800 border-y border-slate-800">
+                {activeLocks.map((lock: any) => {
+                  let scope: string[] = [];
+                  try {
+                    scope = JSON.parse(lock.scope_paths);
+                  } catch {
+                    scope = [];
+                  }
+                  return (
+                    <li key={lock.lock_id} className="flex flex-col gap-1 border-l-[3px] border-l-amber-400 py-3 pl-3 sm:flex-row sm:items-baseline sm:justify-between">
+                      <div className="min-w-0">
+                        <p className="text-sm text-slate-100">
+                          <span className="text-slate-500">#{lock.task_id}</span> {lock.task_title}
+                        </p>
+                        <p className="mt-0.5 flex flex-wrap gap-x-3">
+                          {scope.map((p) => (
+                            <Code key={p} className="text-slate-400">
+                              {displayScope(p)}
+                            </Code>
+                          ))}
+                        </p>
+                      </div>
+                      <p className="shrink-0 text-xs text-amber-300">
+                        {lock.owner_name}, since {when(lock.acquired_at)}
+                      </p>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
 
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="bg-slate-800/60 text-slate-400 uppercase text-[10px] font-semibold border-b border-slate-800">
-              <tr>
-                <th className="px-4 py-3">Action</th>
-                <th className="px-4 py-3">Actor</th>
-                <th className="px-4 py-3">Reference (ref)</th>
-                <th className="px-4 py-3 text-right">Timestamp</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800 text-slate-300">
-              {recentActivity.map((log: any) => {
-                let badgeClass = 'bg-slate-800 text-slate-300';
-                if (log.action === ActionType.LOCK) badgeClass = 'bg-blue-950 text-blue-300 border border-blue-800';
-                if (log.action === ActionType.PULL) badgeClass = 'bg-purple-950 text-purple-300 border border-purple-800';
-                if (log.action === ActionType.PUSH) badgeClass = 'bg-emerald-950 text-emerald-300 border border-emerald-800';
-                if (log.action === ActionType.FORCE_UNLOCK) badgeClass = 'bg-rose-950 text-rose-300 border border-rose-800';
-
-                const isSha = log.action === ActionType.PUSH && log.ref && log.ref.length >= 7;
-
-                return (
-                  <tr key={log.log_id} className="hover:bg-slate-800/40 transition">
-                    <td className="px-4 py-3">
-                      <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${badgeClass}`}>
-                        {log.action}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 font-medium text-white">
-                      {log.user_name}
-                      <span className="text-[10px] text-slate-400 ml-1.5 font-normal">({log.user_role})</span>
-                    </td>
-                    <td className="px-4 py-3 font-mono text-slate-300">
-                      {isSha ? (
-                        <button
-                          onClick={() => onOpenCommitDetails(log.ref)}
-                          className="text-emerald-300 underline hover:text-white flex items-center gap-1"
-                        >
-                          <span>{log.ref.substring(0, 10)}...</span>
-                          <ExternalLink className="w-3 h-3" />
-                        </button>
-                      ) : (
-                        <span>
-                          {log.action === ActionType.PULL ? `Project #${log.ref}` : `Task #${log.ref}`}
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-right text-slate-400">
-                      {new Date(log.created_at).toLocaleString()}
-                    </td>
+          <section>
+            <h2 className="mb-3 text-base font-semibold text-slate-100">{isManager ? 'Developers' : 'Your counters'}</h2>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-800 text-left text-xs text-slate-500">
+                    <th className="py-2 pr-4 font-normal">Name</th>
+                    <th className="py-2 pr-4 text-right font-normal">Finished</th>
+                    <th className="py-2 pr-4 text-right font-normal">Pushes</th>
+                    <th className="py-2 pr-4 text-right font-normal">Downloads</th>
+                    <th className="py-2 text-right font-normal">Last active</th>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                </thead>
+                <tbody className="divide-y divide-slate-800/70">
+                  {developerStats.map((s: any) => (
+                    <tr key={s.user_id}>
+                      <td className="py-2.5 pr-4 text-slate-100">{s.name}</td>
+                      <td className="tabular py-2.5 pr-4 text-right font-semibold text-slate-50">{s.tasks_completed}</td>
+                      <td className="tabular py-2.5 pr-4 text-right text-slate-300">{s.push_count}</td>
+                      <td className="tabular py-2.5 pr-4 text-right text-slate-300">{s.pull_count}</td>
+                      <td className="py-2.5 text-right text-xs text-slate-500">{s.last_activity_at ? when(s.last_activity_at) : 'Not yet'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
         </div>
+
+        <section className="lg:col-span-2">
+          <h2 className="mb-3 text-base font-semibold text-slate-100">Recent activity</h2>
+          {recentActivity.length === 0 ? (
+            <p className="text-sm text-slate-500">Nothing has happened yet.</p>
+          ) : (
+            <ol className="space-y-3">
+              {recentActivity.map((log: any) => (
+                <li key={log.log_id} className="text-sm leading-snug text-slate-300">
+                  {describe(log)}
+                  <span className="block text-xs text-slate-600">{when(log.created_at)}</span>
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
       </div>
     </div>
   );

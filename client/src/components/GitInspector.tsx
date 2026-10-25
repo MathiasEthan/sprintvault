@@ -1,46 +1,37 @@
 import React, { useState, useEffect } from 'react';
 import { Project, GitFileItem, GitMetadata, ScrumFileData } from '../types';
 import { api } from '../api';
-import {
-  FileCode,
-  HardDrive,
-  GitBranch,
-  FolderGit2,
-  Download,
-  RefreshCw,
-  Tag,
-  CheckCircle2,
-  AlertCircle,
-  FileText,
-} from 'lucide-react';
+import { Button, Code, Segmented, Spinner } from './ui';
 
 interface GitInspectorProps {
   project: Project;
   onPullScope: (scope: string[]) => void;
+  refreshKey?: number;
 }
 
-export const GitInspector: React.FC<GitInspectorProps> = ({ project, onPullScope }) => {
-  const [activeSubTab, setActiveSubTab] = useState<'files' | 'scrumFile' | 'gitMeta'>('scrumFile');
+type View = 'files' | 'scrumFile' | 'gitMeta';
+
+export const GitInspector: React.FC<GitInspectorProps> = ({ project, onPullScope, refreshKey }) => {
+  const [view, setView] = useState<View>('files');
   const [files, setFiles] = useState<GitFileItem[]>([]);
   const [selectedFile, setSelectedFile] = useState<GitFileItem | null>(null);
   const [metadata, setMetadata] = useState<GitMetadata | null>(null);
   const [scrumFile, setScrumFile] = useState<ScrumFileData | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
 
-  const loadData = async () => {
-    setLoading(true);
+  const loadData = async (background = false) => {
+    if (!background) setLoading(true);
     try {
       const [filesRes, metaRes, scrumRes] = await Promise.all([
-        api.browseFiles(project.projectId).catch(() => ({ files: [] })),
+        api.browseFiles(project.projectId).catch(() => ({ files: [] as GitFileItem[] })),
         api.getGitMetadata(project.projectId).catch(() => ({ metadata: null })),
         api.getScrumFile(project.projectId).catch(() => ({ scrumFile: null })),
       ]);
       setFiles(filesRes.files);
       setMetadata(metaRes.metadata);
       setScrumFile(scrumRes.scrumFile);
-      if (filesRes.files.length > 0 && !selectedFile) {
-        setSelectedFile(filesRes.files[0]);
-      }
+      // Keep the open file if it still exists in this project, otherwise show the first one
+      setSelectedFile((prev) => filesRes.files.find((f) => f.path === prev?.path) || filesRes.files[0] || null);
     } catch (err) {
       console.error('Failed to load inspector data:', err);
     } finally {
@@ -49,204 +40,121 @@ export const GitInspector: React.FC<GitInspectorProps> = ({ project, onPullScope
   };
 
   useEffect(() => {
+    setSelectedFile(null);
     loadData();
   }, [project.projectId]);
 
+  useEffect(() => {
+    if (refreshKey) loadData(true);
+  }, [refreshKey]);
+
   return (
-    <div className="space-y-5">
-      {/* Sub-tab navigation */}
-      <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-        <div className="flex items-center space-x-2">
-          <button
-            onClick={() => setActiveSubTab('scrumFile')}
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
-              activeSubTab === 'scrumFile'
-                ? 'bg-blue-600/20 text-blue-300 border border-blue-500/40'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            <HardDrive className="w-3.5 h-3.5" />
-            <span>.scrum.json (Scrum Tracker File)</span>
-          </button>
-
-          <button
-            onClick={() => setActiveSubTab('gitMeta')}
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
-              activeSubTab === 'gitMeta'
-                ? 'bg-blue-600/20 text-blue-300 border border-blue-500/40'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            <FolderGit2 className="w-3.5 h-3.5" />
-            <span>.git Folder Inspector</span>
-          </button>
-
-          <button
-            onClick={() => setActiveSubTab('files')}
-            className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
-              activeSubTab === 'files'
-                ? 'bg-blue-600/20 text-blue-300 border border-blue-500/40'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            <FileCode className="w-3.5 h-3.5" />
-            <span>Project Files Tree ({files.length})</span>
-          </button>
+    <div>
+      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+        <Segmented
+          label="Repository view"
+          value={view}
+          onChange={setView}
+          options={[
+            { value: 'files', label: `Files (${files.length})` },
+            { value: 'scrumFile', label: 'Scrum file' },
+            { value: 'gitMeta', label: 'Git status' },
+          ]}
+        />
+        <div className="flex items-center gap-2">
+          {view === 'files' && (
+            <Button size="sm" onClick={() => onPullScope([])}>
+              Download all files
+            </Button>
+          )}
+          <Button size="sm" onClick={() => loadData()}>
+            Refresh
+          </Button>
         </div>
-
-        <button
-          onClick={loadData}
-          className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg border border-slate-700 transition"
-          title="Refresh inspection"
-        >
-          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-        </button>
       </div>
 
-      {/* Sub-tab 1: .scrum.json Viewer */}
-      {activeSubTab === 'scrumFile' && (
-        <div className="space-y-3">
-          <div className="bg-slate-900/80 p-3.5 rounded-xl border border-slate-800 flex items-center justify-between text-xs">
-            <div>
-              <span className="font-bold text-white flex items-center gap-1.5">
-                <HardDrive className="w-4 h-4 text-blue-400" />
-                <span>Single Scrum Tracking File: <code className="text-blue-300">.scrum.json</code></span>
-              </span>
-              <p className="text-[11px] text-slate-400 mt-0.5">
-                Lives in the root of the project directory alongside the <code className="text-slate-300">.git</code> folder. Synchronized automatically on every task and lock action.
-              </p>
-            </div>
-            {scrumFile && (
-              <span className="text-[10px] text-slate-400 font-mono">
-                Last synced: {new Date(scrumFile.lastSyncedAt).toLocaleTimeString()}
-              </span>
-            )}
-          </div>
-
-          <div className="bg-slate-950 rounded-xl border border-slate-800 p-4 font-mono text-xs overflow-auto max-h-[550px] shadow-inner text-emerald-300 leading-relaxed">
-            {scrumFile ? (
-              <pre>{JSON.stringify(scrumFile, null, 2)}</pre>
-            ) : (
-              <div className="text-slate-500 italic py-8 text-center">
-                .scrum.json file not created yet or empty.
+      {loading ? (
+        <Spinner label="Reading the repository…" />
+      ) : view === 'files' ? (
+        files.length === 0 ? (
+          <p className="text-sm text-slate-400">No files are committed on this branch yet.</p>
+        ) : (
+          <div className="grid overflow-hidden rounded-md border border-slate-800 md:grid-cols-[minmax(200px,280px)_1fr]">
+            <ul className="max-h-[520px] overflow-y-auto border-b border-slate-800 py-1 md:border-b-0 md:border-r" aria-label="Files">
+              {files.map((file) => (
+                <li key={file.path}>
+                  <button
+                    onClick={() => setSelectedFile(file)}
+                    aria-current={selectedFile?.path === file.path}
+                    className={`block w-full truncate px-3 py-1 text-left font-mono text-[12px] ${
+                      selectedFile?.path === file.path ? 'bg-slate-800 text-slate-50' : 'text-slate-400 hover:text-slate-100'
+                    }`}
+                  >
+                    {file.path}
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <div className="min-w-0">
+              <div className="flex items-baseline justify-between border-b border-slate-800 px-4 py-2">
+                <Code>{selectedFile?.path}</Code>
+                {selectedFile?.size !== undefined && <span className="tabular text-xs text-slate-500">{selectedFile.size} bytes</span>}
               </div>
-            )}
+              <pre className="max-h-[480px] overflow-auto p-4 font-mono text-[12px] leading-relaxed text-slate-200">
+                {selectedFile?.content}
+              </pre>
+            </div>
           </div>
+        )
+      ) : view === 'scrumFile' ? (
+        <div>
+          <p className="mb-3 max-w-prose text-sm text-slate-400">
+            <Code>.scrum.json</Code> holds this project's tasks, locks and recent activity. SprintVault commits it after every change,
+            so anyone with a clone sees the board's state after <Code>git pull</Code>.
+            {scrumFile && <> Last written {new Date(scrumFile.lastSyncedAt).toLocaleString()}.</>}
+          </p>
+          {scrumFile ? (
+            <pre className="max-h-[560px] overflow-auto rounded-md border border-slate-800 bg-slate-950 p-4 font-mono text-[12px] leading-relaxed text-slate-300">
+              {JSON.stringify(scrumFile, null, 2)}
+            </pre>
+          ) : (
+            <p className="text-sm text-slate-400">The Scrum file is created with the first task or assignment.</p>
+          )}
         </div>
-      )}
-
-      {/* Sub-tab 2: .git Folder Inspector */}
-      {activeSubTab === 'gitMeta' && (
-        <div className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-            {/* HEAD info */}
-            <div className="bg-slate-900/70 p-4 rounded-xl border border-slate-800 space-y-1">
-              <span className="text-[10px] uppercase font-bold text-slate-400 block">
-                .git/HEAD
-              </span>
-              <div className="font-mono text-white text-sm">
-                {metadata?.currentBranch || 'main'}
-              </div>
-              <div className="text-[10px] text-slate-500 font-mono truncate">
-                {metadata?.headRef || 'ref: refs/heads/main'}
-              </div>
+      ) : (
+        <div className="space-y-6">
+          <dl className="grid max-w-3xl grid-cols-1 gap-x-10 gap-y-4 text-sm sm:grid-cols-3">
+            <div>
+              <dt className="text-slate-500">Checked-out branch</dt>
+              <dd className="mt-0.5">
+                <Code className="text-sm">{metadata?.currentBranch}</Code>
+              </dd>
             </div>
-
-            {/* Total Commits */}
-            <div className="bg-slate-900/70 p-4 rounded-xl border border-slate-800 space-y-1">
-              <span className="text-[10px] uppercase font-bold text-slate-400 block">
-                Total Commits
-              </span>
-              <div className="font-mono text-emerald-400 text-sm font-bold">
-                {metadata?.totalCommits || 0} commits
-              </div>
-              <div className="text-[10px] text-slate-500">
-                Directly counted via git rev-list
-              </div>
+            <div>
+              <dt className="text-slate-500">Commits</dt>
+              <dd className="tabular mt-0.5 text-slate-100">{metadata?.totalCommits ?? 0}</dd>
             </div>
-
-            {/* Working Tree Status */}
-            <div className="bg-slate-900/70 p-4 rounded-xl border border-slate-800 space-y-1">
-              <span className="text-[10px] uppercase font-bold text-slate-400 block">
-                Working Tree Status
-              </span>
-              <div className="text-sm font-medium">
-                {metadata?.hasUncommittedChanges ? (
-                  <span className="text-amber-400">Modified (Uncommitted files)</span>
-                ) : (
-                  <span className="text-emerald-400 flex items-center gap-1">
-                    <CheckCircle2 className="w-4 h-4" />
-                    Clean working tree
-                  </span>
-                )}
-              </div>
-              {metadata?.hasUncommittedChanges && (
-                <div className="text-[10px] text-amber-300 font-mono">
-                  {metadata.uncommittedFiles.length} file(s) changed
-                </div>
-              )}
+            <div>
+              <dt className="text-slate-500">Working tree</dt>
+              <dd className={`mt-0.5 ${metadata?.hasUncommittedChanges ? 'text-amber-300' : 'text-slate-100'}`}>
+                {metadata?.hasUncommittedChanges ? `${metadata.uncommittedFiles.length} uncommitted changes` : 'Clean'}
+              </dd>
             </div>
-          </div>
+          </dl>
 
-          {/* .git/config Viewer */}
-          <div className="bg-slate-900/70 rounded-xl border border-slate-800 p-4 space-y-2">
-            <span className="text-xs font-bold text-white block">
-              .git/config file contents:
-            </span>
-            <pre className="bg-slate-950 p-3 rounded-lg border border-slate-800 text-xs font-mono text-slate-300 overflow-x-auto">
+          {metadata?.hasUncommittedChanges && (
+            <pre className="rounded-md border border-slate-800 bg-slate-950 p-3 font-mono text-[12px] text-amber-200">
+              {metadata.uncommittedFiles.join('\n')}
+            </pre>
+          )}
+
+          <div>
+            <h2 className="mb-2 text-sm font-semibold text-slate-200">
+              <Code className="text-sm">.git/config</Code>
+            </h2>
+            <pre className="overflow-x-auto rounded-md border border-slate-800 bg-slate-950 p-3 font-mono text-[12px] text-slate-300">
               {metadata?.config || 'No config found'}
             </pre>
-          </div>
-        </div>
-      )}
-
-      {/* Sub-tab 3: Project Files Tree */}
-      {activeSubTab === 'files' && (
-        <div className="grid grid-cols-1 md:grid-cols-12 gap-5">
-          {/* File Tree */}
-          <div className="md:col-span-4 bg-slate-900/60 rounded-xl border border-slate-800 p-3 h-[480px] overflow-y-auto space-y-1">
-            <span className="text-[11px] uppercase font-bold text-slate-400 block px-2 mb-2">
-              Tracked Code Files
-            </span>
-            {files.map((file) => {
-              const isSelected = selectedFile?.path === file.path;
-              return (
-                <button
-                  key={file.path}
-                  onClick={() => setSelectedFile(file)}
-                  className={`w-full text-left px-2.5 py-1.5 rounded-md text-xs font-mono flex items-center space-x-2 transition ${
-                    isSelected
-                      ? 'bg-blue-600/20 text-blue-300 font-semibold border border-blue-500/30'
-                      : 'text-slate-300 hover:bg-slate-800'
-                  }`}
-                >
-                  <FileCode className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" />
-                  <span className="truncate">{file.path}</span>
-                </button>
-              );
-            })}
-          </div>
-
-          {/* File Viewer */}
-          <div className="md:col-span-8 bg-slate-900/90 rounded-xl border border-slate-800 flex flex-col h-[480px] overflow-hidden">
-            <div className="bg-slate-800/80 px-4 py-2 border-b border-slate-700 flex items-center justify-between text-xs">
-              <span className="font-mono text-slate-200">
-                {selectedFile ? selectedFile.path : 'No file selected'}
-              </span>
-              {selectedFile?.size !== undefined && (
-                <span className="text-[10px] text-slate-400 font-mono">{selectedFile.size} bytes</span>
-              )}
-            </div>
-
-            <div className="flex-1 overflow-auto p-4 bg-slate-950 font-mono text-xs text-slate-200">
-              {selectedFile ? (
-                <pre className="whitespace-pre-wrap leading-relaxed">{selectedFile.content}</pre>
-              ) : (
-                <div className="h-full flex items-center justify-center text-slate-500">
-                  Select a file from the tree to preview
-                </div>
-              )}
-            </div>
           </div>
         </div>
       )}

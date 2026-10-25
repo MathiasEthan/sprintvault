@@ -1,15 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { UserRole } from '../types';
 import { api } from '../api';
-import {
-  X,
-  Upload,
-  FolderArchive,
-  FolderGit2,
-  AlertCircle,
-  CheckCircle2,
-  FileCode,
-} from 'lucide-react';
+import { Button, Field, Notice, Segmented, inputClass, Modal } from './ui';
 
 interface UploadProjectModalProps {
   isOpen: boolean;
@@ -38,6 +30,17 @@ export const UploadProjectModal: React.FC<UploadProjectModalProps> = ({
 
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Fresh form each time it opens; all developers preselected (users load after login)
+  useEffect(() => {
+    if (!isOpen) return;
+    setFile(null);
+    setProjectName('');
+    setDefaultBranch('main');
+    setDirPath('');
+    setSelectedMembers(developers.map((d) => d.user_id));
+    setError(null);
+  }, [isOpen, users.length]);
 
   if (!isOpen) return null;
 
@@ -104,186 +107,81 @@ export const UploadProjectModal: React.FC<UploadProjectModalProps> = ({
     }
   };
 
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-          <div className="flex items-center space-x-2">
-            <div className="w-8 h-8 rounded-lg bg-blue-600/20 text-blue-400 border border-blue-500/40 flex items-center justify-center">
-              <Upload className="w-5 h-5" />
-            </div>
-            <div>
-              <h3 className="text-base font-bold text-white">Add Project to SprintVault</h3>
-              <p className="text-[11px] text-slate-400">Upload ZIP archive or import local codebase directory</p>
-            </div>
-          </div>
-          <button onClick={onClose} className="text-slate-400 hover:text-white transition">
-            <X className="w-5 h-5" />
-          </button>
-        </div>
+    <Modal
+      title="Import project"
+      onClose={onClose}
+      footer={
+        <>
+          <Button variant="quiet" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" type="submit" form="import-project-form" disabled={loading}>
+            {loading ? 'Importing…' : 'Import project'}
+          </Button>
+        </>
+      }
+    >
+      <Segmented
+        label="Import from"
+        value={tab}
+        onChange={setTab}
+        options={[
+          { value: 'upload', label: 'Zip file' },
+          { value: 'local', label: 'Folder on this server' },
+        ]}
+      />
 
-        {/* Tab switch */}
-        <div className="grid grid-cols-2 gap-2 bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs">
-          <button
-            type="button"
-            onClick={() => setTab('upload')}
-            className={`flex items-center justify-center space-x-1.5 py-1.5 rounded-md font-medium transition ${
-              tab === 'upload' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            <FolderArchive className="w-4 h-4" />
-            <span>Upload ZIP Archive</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setTab('local')}
-            className={`flex items-center justify-center space-x-1.5 py-1.5 rounded-md font-medium transition ${
-              tab === 'local' ? 'bg-blue-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            <FolderGit2 className="w-4 h-4" />
-            <span>Link Local Directory</span>
-          </button>
-        </div>
+      {error && <Notice>{error}</Notice>}
 
-        {error && (
-          <div className="bg-rose-950/70 border border-rose-800 text-rose-200 text-xs p-3 rounded-lg flex items-center space-x-2">
-            <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
-            <span>{error}</span>
-          </div>
+      <form id="import-project-form" onSubmit={handleSubmit} className="space-y-4">
+        {tab === 'upload' ? (
+          <Field label="Zip file" htmlFor="zip-upload-input" hint="Include the .git folder to keep the project's history.">
+            <input
+              id="zip-upload-input"
+              type="file"
+              accept=".zip"
+              onChange={handleFileChange}
+              className="block w-full text-sm text-slate-300 file:mr-3 file:h-8 file:cursor-pointer file:rounded file:border file:border-slate-700 file:bg-transparent file:px-3 file:text-sm file:text-slate-100 hover:file:border-slate-500"
+            />
+          </Field>
+        ) : (
+          <Field
+            label="Folder path"
+            htmlFor="dir-path"
+            hint="The folder keeps its files. If it isn't a git repository yet, SprintVault creates one from what's there."
+          >
+            <input
+              id="dir-path"
+              value={dirPath}
+              onChange={(e) => setDirPath(e.target.value)}
+              placeholder="C:\Work\payments-service"
+              className={`${inputClass} font-mono text-[12px]`}
+            />
+          </Field>
         )}
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {tab === 'upload' ? (
-            /* ZIP Upload */
-            <div className="space-y-3">
-              <div>
-                <label className="text-xs font-semibold text-slate-300 block mb-1">
-                  Select Project ZIP File:
-                </label>
-                <div className="border-2 border-dashed border-slate-700 hover:border-blue-500 rounded-xl p-5 text-center cursor-pointer transition bg-slate-950/40">
-                  <input
-                    type="file"
-                    accept=".zip"
-                    onChange={handleFileChange}
-                    className="hidden"
-                    id="zip-upload-input"
-                  />
-                  <label htmlFor="zip-upload-input" className="cursor-pointer block">
-                    <FolderArchive className="w-8 h-8 text-blue-400 mx-auto mb-2" />
-                    {file ? (
-                      <div className="text-xs font-medium text-emerald-400">
-                        Selected: {file.name} ({(file.size / 1024 / 1024).toFixed(2)} MB)
-                      </div>
-                    ) : (
-                      <>
-                        <div className="text-xs font-medium text-white">Click or drag & drop project .zip here</div>
-                        <div className="text-[10px] text-slate-500 mt-1">Contains codebase and .git folder</div>
-                      </>
-                    )}
-                  </label>
-                </div>
-              </div>
+        <Field label="Name" htmlFor="import-name" hint={tab === 'local' ? 'Leave empty to use the folder name.' : undefined}>
+          <input id="import-name" value={projectName} onChange={(e) => setProjectName(e.target.value)} className={inputClass} />
+        </Field>
 
-              <div>
-                <label className="text-xs font-semibold text-slate-300 block mb-1">
-                  Project Name:
-                </label>
-                <input
-                  type="text"
-                  value={projectName}
-                  onChange={(e) => setProjectName(e.target.value)}
-                  placeholder="e.g. Microservice API"
-                  className="w-full bg-slate-950 text-xs text-white px-3 py-2 rounded-lg border border-slate-700 focus:outline-none focus:border-blue-500"
-                />
-              </div>
-            </div>
-          ) : (
-            /* Local Directory Path */
-            <div className="space-y-3">
-              <div>
-                <label className="text-xs font-semibold text-slate-300 block mb-1">
-                  Local Absolute Directory Path:
-                </label>
-                <input
-                  type="text"
-                  value={dirPath}
-                  onChange={(e) => setDirPath(e.target.value)}
-                  placeholder="/home/ethan/Work/my-scrum-project"
-                  className="w-full bg-slate-950 font-mono text-xs text-white px-3 py-2 rounded-lg border border-slate-700 focus:outline-none focus:border-blue-500"
-                />
-                <span className="text-[10px] text-slate-500 mt-1 block">
-                  SprintVault will read the existing <code className="text-blue-300">.git</code> folder and initialize <code className="text-blue-300">.scrum.json</code> in this directory.
-                </span>
-              </div>
+        <Field label="Default branch" htmlFor="import-branch">
+          <input id="import-branch" value={defaultBranch} onChange={(e) => setDefaultBranch(e.target.value)} className={`${inputClass} font-mono text-[12px]`} />
+        </Field>
 
-              <div>
-                <label className="text-xs font-semibold text-slate-300 block mb-1">
-                  Project Display Name:
-                </label>
-                <input
-                  type="text"
-                  value={projectName}
-                  onChange={(e) => setProjectName(e.target.value)}
-                  placeholder="Leave blank to use folder name"
-                  className="w-full bg-slate-950 text-xs text-white px-3 py-2 rounded-lg border border-slate-700 focus:outline-none focus:border-blue-500"
-                />
-              </div>
-            </div>
-          )}
-
-          <div>
-            <label className="text-xs font-semibold text-slate-300 block mb-1">
-              Default Branch:
-            </label>
-            <input
-              type="text"
-              value={defaultBranch}
-              onChange={(e) => setDefaultBranch(e.target.value)}
-              placeholder="main"
-              className="w-full bg-slate-950 font-mono text-xs text-white px-3 py-2 rounded-lg border border-slate-700 focus:outline-none focus:border-blue-500"
-            />
+        <fieldset>
+          <legend className="mb-1.5 text-xs font-medium text-slate-300">Developers</legend>
+          <div className="grid grid-cols-2 gap-1.5">
+            {developers.map((dev) => (
+              <label key={dev.user_id} className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+                <input type="checkbox" checked={selectedMembers.includes(dev.user_id)} onChange={() => handleMemberToggle(dev.user_id)} />
+                {dev.name}
+              </label>
+            ))}
           </div>
-
-          <div>
-            <label className="text-xs font-semibold text-slate-300 block mb-1.5">
-              Assign Developers to Project:
-            </label>
-            <div className="space-y-1 max-h-32 overflow-y-auto bg-slate-950/70 p-2 rounded-lg border border-slate-800">
-              {developers.map((dev) => (
-                <label key={dev.user_id} className="flex items-center space-x-2 text-xs text-slate-300 cursor-pointer hover:text-white">
-                  <input
-                    type="checkbox"
-                    checked={selectedMembers.includes(dev.user_id)}
-                    onChange={() => handleMemberToggle(dev.user_id)}
-                    className="rounded border-slate-700 text-blue-600 focus:ring-0"
-                  />
-                  <span>{dev.name}</span>
-                </label>
-              ))}
-            </div>
-          </div>
-
-          <div className="flex justify-end space-x-3 pt-3 border-t border-slate-800">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-4 py-2 text-xs text-slate-300 hover:text-white transition"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={loading}
-              className="flex items-center space-x-1.5 px-5 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold rounded-lg transition disabled:opacity-50"
-            >
-              <Upload className="w-4 h-4" />
-              <span>{loading ? 'Processing...' : 'Add Project'}</span>
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
+        </fieldset>
+      </form>
+    </Modal>
   );
 };

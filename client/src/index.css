@@ -3,31 +3,63 @@
 @tailwind utilities;
 
 :root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  font-family: Archivo, system-ui, sans-serif;
+  font-size: 13.5px;
   line-height: 1.5;
   font-weight: 400;
   color-scheme: dark;
+  accent-color: #18c461;
+  -webkit-font-smoothing: antialiased;
 }
 
 body {
   margin: 0;
-  background-color: #0b0f17;
-  color: #f1f5f9;
+  background-color: #000000;
+  color: #ededed;
   min-height: 100vh;
 }
 
-/* Custom scrollbars */
+::selection {
+  background: rgba(24, 196, 97, 0.35);
+}
+
+:focus-visible {
+  outline: 2px solid #3ddc7f;
+  outline-offset: 2px;
+}
+
+@layer utilities {
+  /* Expanded heavy Archivo: wordmark and page titles only */
+  .font-display {
+    font-stretch: 125%;
+    font-weight: 800;
+    letter-spacing: -0.015em;
+  }
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: #0f172a;
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #334155;
+  background: #2a2a2a;
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #475569;
+  background: #3a3a3a;
 }
