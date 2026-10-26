@@ -1,6 +1,7 @@
 import { Router, Response } from 'express';
 import { authenticate, AuthenticatedRequest, requireManager, requireDeveloper } from '../middleware/auth';
 import { WorkflowService } from '../services/WorkflowService';
+import { LockManager } from '../services/LockManager';
 import { Task } from '../models/Task';
 import { FileLock } from '../models/FileLock';
 import { Project } from '../models/Project';
@@ -20,7 +21,8 @@ router.get('/', authenticate, (req: AuthenticatedRequest, res: Response) => {
 
   let query = `
     SELECT t.*, p.name as project_name, u.name as assignee_name, u.email as assignee_email,
-           fl.lock_id, fl.owner_id as lock_owner_id, lu.name as lock_owner_name, fl.acquired_at as lock_acquired_at
+           fl.lock_id, fl.owner_id as lock_owner_id, lu.name as lock_owner_name, fl.acquired_at as lock_acquired_at,
+           CASE WHEN fl.lock_id IS NULL THEN NULL ELSE ${LockManager.lastActivitySql('fl', 't')} END as lock_last_activity_at
     FROM tasks t
     JOIN projects p ON t.project_id = p.project_id
     LEFT JOIN users u ON t.assignee_id = u.user_id
@@ -67,10 +69,11 @@ router.get('/', authenticate, (req: AuthenticatedRequest, res: Response) => {
       ...t,
       scope_paths: scopePaths,
       has_active_lock: !!t.lock_id,
+      lock_is_stale: !!t.lock_id && LockManager.isStale(t.lock_last_activity_at),
     };
   });
 
-  return res.json({ tasks: mapped });
+  return res.json({ tasks: mapped, staleAfterHours: LockManager.staleAfterHours() });
 });
 
 /**
@@ -196,8 +199,16 @@ router.post('/:id/push', authenticate, requireDeveloper, (req: AuthenticatedRequ
  */
 router.post('/:id/force-release', authenticate, requireManager, (req: AuthenticatedRequest, res: Response) => {
   try {
-    WorkflowService.forceRelease(requireId(req.params.id, 'Task id'), req.user!.userId);
-    return res.json({ success: true, message: 'Lock force-released and task reset to ASSIGNED' });
+    const reason = req.body?.reason;
+    if (reason !== undefined && reason !== null && typeof reason !== 'string') {
+      throw new ValidationError('reason must be a string');
+    }
+    const { stale } = WorkflowService.forceRelease(requireId(req.params.id, 'Task id'), req.user!.userId, reason ?? undefined);
+    return res.json({
+      success: true,
+      stale,
+      message: stale ? 'Stale lock released and task reset to ASSIGNED' : 'Lock force-released and task reset to ASSIGNED',
+    });
   } catch (err) {
     return sendError(res, err);
   }

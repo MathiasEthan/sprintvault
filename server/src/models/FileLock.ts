@@ -1,13 +1,16 @@
 import { db } from '../db/database';
 import { FileLockRow, LockStatus } from '../types';
 
+// Comparison key for a repository path. Lower-cased because Windows and macOS checkouts treat
+// 'SRC/Auth' and 'src/auth' as the same folder, so they must also be the same lock.
 function normalizePrefix(p: string): string {
   return p
     .trim()
     .replace(/\\/g, '/')
     .split('/')
     .filter((s) => s !== '' && s !== '.')
-    .join('/');
+    .join('/')
+    .toLowerCase();
 }
 
 export function prefixOverlaps(p1: string, p2: string): boolean {
@@ -26,6 +29,17 @@ export function prefixOverlaps(p1: string, p2: string): boolean {
   return false;
 }
 
+/**
+ * True when filePath is the scope path itself or lies inside it (scope '/' covers the whole repository).
+ */
+export function pathInScope(filePath: string, scopePaths: string[]): boolean {
+  const file = normalizePrefix(filePath);
+  return scopePaths.some((scope) => {
+    const s = normalizePrefix(scope);
+    return s === '' || file === s || file.startsWith(s + '/');
+  });
+}
+
 export class FileLock {
   public lockId: number;
   public taskId: number;
@@ -34,6 +48,7 @@ export class FileLock {
   public acquiredAt: string;
   public releasedAt: string | null;
   public status: LockStatus;
+  public baseSha: string | null;
 
   constructor(
     lockId: number,
@@ -42,8 +57,10 @@ export class FileLock {
     scopePaths: string[],
     acquiredAt: string,
     releasedAt: string | null,
-    status: LockStatus
+    status: LockStatus,
+    baseSha: string | null = null
   ) {
+    this.baseSha = baseSha;
     this.lockId = lockId;
     this.taskId = taskId;
     this.ownerId = ownerId;
@@ -67,7 +84,8 @@ export class FileLock {
       scopePaths,
       row.acquired_at,
       row.released_at,
-      row.status
+      row.status,
+      row.base_sha
     );
   }
 

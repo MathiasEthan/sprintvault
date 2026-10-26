@@ -2,14 +2,15 @@ import fs from 'fs';
 import { db } from '../db/database';
 import { Project } from '../models/Project';
 import { Task } from '../models/Task';
-import { FileLock } from '../models/FileLock';
+import { FileLock, pathInScope } from '../models/FileLock';
 import { ActivityLog } from '../models/ActivityLog';
+import { GovernanceEvent, projectFilter } from '../models/GovernanceEvent';
 import { User } from '../models/User';
 import { LockManager } from './LockManager';
 import { GitService } from './GitService';
 import { ScrumFileService } from './ScrumFileService';
 import { ChangeFeed } from './ChangeFeed';
-import { ActionType, GitFileItem, TaskStatus, UserRole, GitGraphNode, GitMetadata } from '../types';
+import { ActionType, GitFileItem, GovernanceKind, TaskStatus, UserRole, GitGraphNode, GitMetadata } from '../types';
 import { ValidationError, normalizeScopePaths, requireText, validatePushFiles } from '../validation';
 
 export class WorkflowService {
@@ -219,10 +220,25 @@ export class WorkflowService {
       throw { type: 'rejectStart', reason: `Task cannot be started from status '${task.status}'` };
     }
 
-    const { lock, reason } = LockManager.acquire(taskId, task.scopePaths, devId);
+    // Branch head when work starts: Commit Done checks every commit made after it (sync first so it is current)
+    const project = Project.findById(task.projectId);
+    let baseSha: string | null = null;
+    if (project) {
+      const git = GitService.forProject(project);
+      try {
+        git.sync();
+      } catch (err: any) {
+        console.error(`Sync before starting task #${taskId} failed:`, err.message);
+      }
+      baseSha = git.branchHead();
+    }
+
+    const { lock, reason, conflict, blockingSince } = LockManager.acquire(taskId, task.scopePaths, devId, baseSha);
 
     if (!lock) {
-      throw { type: 'rejectStart', reason: reason || 'Scope is locked by another active task' };
+      const why = reason || 'Scope is locked by another active task';
+      if (conflict) GovernanceEvent.record(GovernanceKind.LOCK_CONFLICT, devId, task.projectId, taskId, why, blockingSince);
+      throw { type: 'rejectStart', reason: why };
     }
 
     task.start();
@@ -339,6 +355,13 @@ export class WorkflowService {
     if (git.commitTime(resolved) < lockStartedAt) {
       throw reject(`Commit ${resolved.substring(0, 7)} was made before work on this task started (${lock.acquiredAt})`);
     }
+    const authorEmail = git.commitAuthorEmail(resolved);
+    if (authorEmail.toLowerCase() !== dev.email.toLowerCase()) {
+      throw reject(
+        `Commit ${resolved.substring(0, 7)} was written by ${authorEmail}, not by you (${dev.email}). Commit with git config user.email "${dev.email}"`
+      );
+    }
+    WorkflowService.assertWorkInScope(task, dev, git, lock, resolved);
 
     task.complete(resolved);
     LockManager.release(taskId);
@@ -388,6 +411,7 @@ export class WorkflowService {
 
     const cleanFiles = validatePushFiles(files);
     const cleanMsg = requireText(msg, 'Commit message', 5000);
+    WorkflowService.assertInScope(task, devId, cleanFiles.map((f) => f.path), 'This push changes');
 
     let sha: string;
     try {
@@ -409,9 +433,55 @@ export class WorkflowService {
   }
 
   /**
-   * Flow 4.4: Force-release (UC-13, Manager only)
+   * LOGIC §7 scope rule: a task may only change files inside the scope it locked.
+   * Blocked attempts are recorded so the dashboard can show them.
    */
-  static forceRelease(taskId: number, managerId: number): void {
+  private static assertInScope(task: Task, devId: number, filePaths: string[], what: string, allowed: string[] = task.scopePaths): void {
+    const outside = filePaths.filter((p) => p !== '.scrum.json' && !pathInScope(p, allowed));
+    if (outside.length === 0) return;
+    const reason = `${what} ${outside.map((p) => `'${p}'`).join(', ')}, outside this task's scope (${task.scopePaths.join(', ')})`;
+    const lock = FileLock.findActiveByTaskId(task.taskId);
+    GovernanceEvent.record(GovernanceKind.SCOPE_VIOLATION, devId, task.projectId, task.taskId, reason, lock?.acquiredAt);
+    throw { type: 'rejectPush', reason };
+  }
+
+  /**
+   * Commit Done scope rule: every commit the developer made since the lock was taken (up to the linked one)
+   * must stay in scope, not only the linked commit, and merges are checked for changes of their own.
+   * Commits by others, SprintVault bookkeeping and commits already linked to another task are not this task's work;
+   * files covered by the developer's other active locks in the project are allowed.
+   */
+  private static assertWorkInScope(task: Task, dev: User, git: GitService, lock: FileLock, sha: string): void {
+    const linkedElsewhere = new Set(
+      (db.prepare('SELECT commit_sha FROM tasks WHERE project_id = ? AND commit_sha IS NOT NULL AND task_id != ?')
+        .all(task.projectId, task.taskId) as unknown as Array<{ commit_sha: string }>).map((r) => r.commit_sha)
+    );
+    const otherScopes = (db.prepare(`
+      SELECT fl.scope_paths FROM file_locks fl JOIN tasks t ON fl.task_id = t.task_id
+      WHERE fl.status = 'ACTIVE' AND fl.owner_id = ? AND t.project_id = ? AND fl.task_id != ?
+    `).all(dev.userId, task.projectId, task.taskId) as unknown as Array<{ scope_paths: string }>)
+      .flatMap((r) => JSON.parse(r.scope_paths) as string[]);
+
+    for (const commit of git.commitsSince(lock.baseSha, sha)) {
+      if (commit !== sha) {
+        if (linkedElsewhere.has(commit) || git.isServiceCommit(commit)) continue;
+        if (git.commitAuthorEmail(commit).toLowerCase() !== dev.email.toLowerCase()) continue;
+      }
+      WorkflowService.assertInScope(
+        task,
+        dev.userId,
+        git.commitFiles(commit),
+        `Commit ${commit.substring(0, 7)} changes`,
+        [...task.scopePaths, ...otherScopes]
+      );
+    }
+  }
+
+  /**
+   * Flow 4.4: Force-release (UC-13, Manager only). The reason is kept in the governance log;
+   * releasing a lock that went stale is counted separately from an ordinary override.
+   */
+  static forceRelease(taskId: number, managerId: number, reason?: string): { stale: boolean } {
     WorkflowService.requireManager(managerId);
 
     const task = Task.findById(taskId);
@@ -423,11 +493,23 @@ export class WorkflowService {
       throw new Error('Task is not in IN_PROGRESS state');
     }
 
+    const note = reason === undefined || reason === null || reason === '' ? 'No reason given' : requireText(reason, 'Reason', 300);
+    const lastActivity = LockManager.lastActivity(taskId);
+    const stale = LockManager.isStale(lastActivity);
+
     LockManager.revoke(taskId);
     task.reset();
     ActivityLog.record(managerId, ActionType.FORCE_UNLOCK, taskId);
+    GovernanceEvent.record(
+      stale ? GovernanceKind.STALE_RELEASE : GovernanceKind.FORCE_RELEASE,
+      managerId,
+      task.projectId,
+      taskId,
+      stale ? `${note} (no activity since ${lastActivity})` : note
+    );
 
-    WorkflowService.recordScrumChange(task.projectId, `force-release task #${taskId}`);
+    WorkflowService.recordScrumChange(task.projectId, `${stale ? 'release stale lock on' : 'force-release'} task #${taskId}`);
+    return { stale };
   }
 
   /**
@@ -511,20 +593,26 @@ export class WorkflowService {
 
     // Same row shape for both roles (snake_case, as the client expects)
     const developerStats = db.prepare(`
-      SELECT s.*, u.name, u.email
+      SELECT s.*, u.name, u.email,
+        (SELECT AVG((julianday(l.released_at) - julianday(l.acquired_at)) * 24)
+         FROM file_locks l WHERE l.owner_id = s.user_id AND l.status = 'RELEASED') as avg_cycle_hours
       FROM developer_stats s
       JOIN users u ON s.user_id = u.user_id
       ${isManager ? '' : 'WHERE s.user_id = ?'}
       ORDER BY s.tasks_completed DESC, s.push_count DESC
     `).all(...(isManager ? [] : [userId])) as unknown as any[];
 
-    const activeLocks = db.prepare(`
-      SELECT l.*, t.title as task_title, t.project_id, u.name as owner_name
+    const activeLocks = (db.prepare(`
+      SELECT l.*, t.title as task_title, t.project_id, u.name as owner_name,
+             ${LockManager.lastActivitySql('l', 't')} as last_activity_at
       FROM file_locks l
       JOIN tasks t ON l.task_id = t.task_id
       JOIN users u ON l.owner_id = u.user_id
       WHERE l.status = 'ACTIVE' ${isManager ? '' : 'AND l.owner_id = ?'}
-    `).all(...(isManager ? [] : [userId])) as unknown as any[];
+    `).all(...(isManager ? [] : [userId])) as unknown as any[]).map((l) => ({
+      ...l,
+      is_stale: LockManager.isStale(l.last_activity_at),
+    }));
 
     const recentActivity = isManager ? ActivityLog.findAll(30) : ActivityLog.findByUserId(userId, 30);
 
@@ -535,6 +623,47 @@ export class WorkflowService {
       developerStats,
       activeLocks,
       recentActivity,
+      metrics: WorkflowService.getMetrics(isManager ? null : (db.prepare(
+        'SELECT project_id FROM project_members WHERE user_id = ?'
+      ).all(userId) as unknown as Array<{ project_id: number }>).map((r) => r.project_id)),
+    };
+  }
+
+  /**
+   * Governance metrics for the dashboard, over the given projects (null = all projects).
+   */
+  static getMetrics(projectIds: number[] | null) {
+    const counts = GovernanceEvent.countsByKind(projectIds);
+    const { clause, params } = projectFilter('t.project_id', projectIds);
+
+    const cycle = db.prepare(`
+      SELECT AVG((julianday(l.released_at) - julianday(l.acquired_at)) * 24) as hours
+      FROM file_locks l JOIN tasks t ON l.task_id = t.task_id
+      WHERE l.status = 'RELEASED' AND ${clause}
+    `).get(...params) as { hours: number | null };
+
+    const weekAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+    const completedThisWeek = (db.prepare(`
+      SELECT COUNT(*) as n FROM tasks t WHERE t.status = 'COMPLETED' AND t.completed_at >= ? AND ${clause}
+    `).get(weekAgo, ...params) as { n: number }).n;
+
+    const lockActivity = db.prepare(`
+      SELECT ${LockManager.lastActivitySql('l', 't')} as last_activity_at
+      FROM file_locks l JOIN tasks t ON l.task_id = t.task_id
+      WHERE l.status = 'ACTIVE' AND ${clause}
+    `).all(...params) as unknown as Array<{ last_activity_at: string }>;
+
+    return {
+      conflictsPrevented: counts[GovernanceKind.LOCK_CONFLICT],
+      scopeViolationsBlocked: counts[GovernanceKind.SCOPE_VIOLATION],
+      staleLocksReleased: counts[GovernanceKind.STALE_RELEASE],
+      forceReleases: counts[GovernanceKind.FORCE_RELEASE],
+      avgCycleHours: cycle.hours,
+      completedThisWeek,
+      activeLocks: lockActivity.length,
+      staleLocks: lockActivity.filter((l) => LockManager.isStale(l.last_activity_at)).length,
+      staleAfterHours: LockManager.staleAfterHours(),
+      recentEvents: GovernanceEvent.recent(projectIds, 10),
     };
   }
 }

@@ -193,10 +193,10 @@ function AppContent() {
     }
   };
 
-  const handleForceRelease = async (taskId: number) => {
+  const handleForceRelease = async (taskId: number, reason?: string) => {
     try {
-      await api.forceRelease(taskId);
-      showBanner('info', `Released the lock on #${taskId}. It is back in Assigned.`);
+      const res = await api.forceRelease(taskId, reason);
+      showBanner('info', `Released the ${res.stale ? 'stale ' : ''}lock on #${taskId}. It is back in Assigned.`);
       await loadTasks();
     } catch (err: any) {
       showBanner('error', err.message);

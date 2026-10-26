@@ -18,6 +18,13 @@ export enum ActionType {
   FORCE_UNLOCK = 'FORCE_UNLOCK',
 }
 
+export enum GovernanceKind {
+  LOCK_CONFLICT = 'LOCK_CONFLICT',
+  SCOPE_VIOLATION = 'SCOPE_VIOLATION',
+  FORCE_RELEASE = 'FORCE_RELEASE',
+  STALE_RELEASE = 'STALE_RELEASE',
+}
+
 export enum UserRole {
   MANAGER = 'MANAGER',
   DEVELOPER = 'DEVELOPER',
@@ -58,6 +65,7 @@ export interface FileLockRow {
   acquired_at: string;
   released_at: string | null;
   status: LockStatus;
+  base_sha: string | null; // branch head when the lock was taken
 }
 
 export interface ActivityLogRow {
@@ -65,6 +73,16 @@ export interface ActivityLogRow {
   user_id: number;
   action: ActionType;
   ref: string;
+  created_at: string;
+}
+
+export interface GovernanceEventRow {
+  event_id: number;
+  kind: GovernanceKind;
+  user_id: number;
+  project_id: number;
+  task_id: number;
+  detail: string;
   created_at: string;
 }
 

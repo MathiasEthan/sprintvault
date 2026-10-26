@@ -11,6 +11,7 @@ import {
   GitGraphNode,
   GitMetadata,
   ScrumFileData,
+  GovernanceMetrics,
 } from './types';
 
 const API_BASE = '/api';
@@ -163,9 +164,10 @@ export const api = {
       body: JSON.stringify({ files, msg }),
     });
   },
-  forceRelease: async (taskId: number) => {
-    return request<{ success: boolean; message: string }>(`/tasks/${taskId}/force-release`, {
+  forceRelease: async (taskId: number, reason?: string) => {
+    return request<{ success: boolean; stale: boolean; message: string }>(`/tasks/${taskId}/force-release`, {
       method: 'POST',
+      body: JSON.stringify({ reason }),
     });
   },
 
@@ -197,6 +199,7 @@ export const api = {
       developerStats: DeveloperStats[];
       activeLocks: any[];
       recentActivity: ActivityLogItem[];
+      metrics: GovernanceMetrics;
     }>('/dashboard');
   },
 };

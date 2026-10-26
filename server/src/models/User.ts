@@ -20,9 +20,6 @@ function resolveJwtSecret(): string {
 
 export const JWT_SECRET = resolveJwtSecret();
 
-// Revoked token ids (jti) -> expiry (epoch seconds). Entries are dropped once the token would have expired anyway.
-const revokedTokens = new Map<string, number>();
-
 export abstract class User {
   public userId: number;
   public name: string;
@@ -72,16 +69,17 @@ export abstract class User {
     return { user, token };
   }
 
+  /**
+   * Revocations are stored in the database so a logged-out token stays invalid across restarts.
+   * Rows are dropped once the token would have expired anyway.
+   */
   static revokeToken(jti: string, expiresAt: number): void {
-    const now = Math.floor(Date.now() / 1000);
-    for (const [id, exp] of revokedTokens) {
-      if (exp < now) revokedTokens.delete(id);
-    }
-    revokedTokens.set(jti, expiresAt);
+    db.prepare('DELETE FROM revoked_tokens WHERE expires_at < ?').run(Math.floor(Date.now() / 1000));
+    db.prepare('INSERT OR IGNORE INTO revoked_tokens (jti, expires_at) VALUES (?, ?)').run(jti, expiresAt);
   }
 
   static isTokenRevoked(jti: string | undefined): boolean {
-    return !!jti && revokedTokens.has(jti);
+    return !!jti && !!db.prepare('SELECT 1 FROM revoked_tokens WHERE jti = ?').get(jti);
   }
 
   logout(): boolean {

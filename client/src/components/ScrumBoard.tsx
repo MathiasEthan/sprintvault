@@ -10,7 +10,7 @@ interface ScrumBoardProps {
   onOpenCommitDone: (task: Task) => void;
   onOpenPushModal: (task: Task) => void;
   onAssignTask: (taskId: number, devId: number) => Promise<void>;
-  onForceRelease: (taskId: number) => Promise<void>;
+  onForceRelease: (taskId: number, reason?: string) => Promise<void>;
   onOpenCommitDetails: (sha: string) => void;
   onCreateTaskClick: () => void;
   onPullCodeClick: (scope: string[]) => void;
@@ -39,6 +39,14 @@ function formatWhen(iso?: string | null): string {
   return sameDay
     ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+function idleFor(iso?: string | null): string {
+  if (!iso) return '';
+  const minutes = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 60000));
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 48 ? `${hours}h` : `${Math.floor(hours / 24)}d`;
 }
 
 export const ScrumBoard: React.FC<ScrumBoardProps> = ({
@@ -123,10 +131,11 @@ export const ScrumBoard: React.FC<ScrumBoardProps> = ({
               {laneTasks.map((task) => {
                 const isAssignee = currentUser?.userId === task.assignee_id;
                 const busy = loadingTaskId === task.task_id;
+                const stale = task.status === TaskStatus.IN_PROGRESS && !!task.lock_is_stale;
                 return (
                   <article
                     key={task.task_id}
-                    className={`rounded-md border border-l-[3px] border-slate-800 bg-slate-900 px-3 py-2.5 ${RAIL[task.status]}`}
+                    className={`rounded-md border border-l-[3px] border-slate-800 bg-slate-900 px-3 py-2.5 ${stale ? 'border-l-rose-500' : RAIL[task.status]}`}
                   >
                     <h3 className="text-sm font-medium leading-snug text-slate-50">
                       <span className="mr-1.5 font-normal text-slate-500">#{task.task_id}</span>
@@ -149,6 +158,12 @@ export const ScrumBoard: React.FC<ScrumBoardProps> = ({
                         <span className="text-amber-300">
                           Locked by {isAssignee ? 'you' : task.lock_owner_name || task.assignee_name}
                           {task.lock_acquired_at && ` since ${formatWhen(task.lock_acquired_at)}`}
+                        </span>
+                      )}
+                      {stale && (
+                        <span className="mt-1 block text-rose-300">
+                          Stale: no activity for {idleFor(task.lock_last_activity_at)}.
+                          {isAssignee ? ' The team lead may release this lock.' : ''}
                         </span>
                       )}
                       {task.status === TaskStatus.COMPLETED && (
@@ -207,12 +222,16 @@ export const ScrumBoard: React.FC<ScrumBoardProps> = ({
                             className="text-rose-300 hover:text-rose-200"
                             disabled={busy}
                             onClick={() => {
-                              if (confirm(`Release the lock on #${task.task_id}? The task goes back to ${task.assignee_name} as Assigned.`)) {
-                                run(task.task_id, () => onForceRelease(task.task_id));
+                              const reason = prompt(
+                                `Release the ${stale ? 'stale ' : ''}lock on #${task.task_id}? The task goes back to ${task.assignee_name} as Assigned.\n\nReason (kept in the audit log):`,
+                                stale ? `No activity for ${idleFor(task.lock_last_activity_at)}` : ''
+                              );
+                              if (reason !== null) {
+                                run(task.task_id, () => onForceRelease(task.task_id, reason.trim() || undefined));
                               }
                             }}
                           >
-                            {busy ? 'Releasing…' : 'Release lock'}
+                            {busy ? 'Releasing…' : stale ? 'Release stale lock' : 'Release lock'}
                           </Button>
                         )}
                         {task.status !== TaskStatus.COMPLETED && (

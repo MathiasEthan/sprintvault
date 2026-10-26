@@ -180,6 +180,22 @@ export class GitService {
     return GitHost.getCommitAuthorEmail(this.repoPath, sha) === GitHost.serviceUser.email;
   }
 
+  commitFiles(sha: string): string[] {
+    return GitHost.getCommitFiles(this.repoPath, sha);
+  }
+
+  commitsSince(base: string | null, sha: string): string[] {
+    return GitHost.getCommitsSince(this.repoPath, base, sha);
+  }
+
+  commitAuthorEmail(sha: string): string {
+    return GitHost.getCommitAuthorEmail(this.repoPath, sha);
+  }
+
+  branchHead(): string | null {
+    return GitHost.getBranchHead(this.repoPath, this.defaultBranch);
+  }
+
   commitTime(sha: string): number {
     return GitHost.getCommitTime(this.repoPath, sha);
   }
