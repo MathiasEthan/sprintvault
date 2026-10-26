@@ -1,155 +1,98 @@
 import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { UserRole } from '../types';
-import { Shield, Lock, Mail, ArrowRight, UserCheck, AlertCircle } from 'lucide-react';
+import { Button, Field, Notice, inputClass } from './ui';
 
 export const LoginView: React.FC = () => {
-  const { login, allUsers } = useAuth();
-  const [email, setEmail] = useState<string>('lead@sprintvault.com');
-  const [password, setPassword] = useState<string>('password123');
+  const { login, switchUser, demoUsers, demoMode } = useAuth();
+  const [email, setEmail] = useState<string>('');
+  const [password, setPassword] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const attempt = async (fn: () => Promise<void>) => {
     setLoading(true);
     setError(null);
     try {
-      await login(email, password);
-    } catch (err: any) {
-      setError(err.message || 'Login failed');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleQuickLogin = async (userEmail: string) => {
-    setEmail(userEmail);
-    setPassword('password123');
-    setLoading(true);
-    setError(null);
-    try {
-      await login(userEmail, 'password123');
-    } catch (err: any) {
-      setError(err.message || 'Login failed');
+      await fn();
+    } catch {
+      setError('That email and password do not match an account.');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4 bg-slate-950 bg-[radial-gradient(ellipse_80%_80%_at_50%_-20%,rgba(59,130,246,0.15),rgba(255,255,255,0))]">
-      <div className="max-w-md w-full space-y-6">
-        {/* Brand header */}
-        <div className="text-center space-y-2">
-          <div className="w-14 h-14 rounded-2xl bg-blue-600/20 border border-blue-500/40 flex items-center justify-center text-blue-400 mx-auto shadow-lg shadow-blue-900/30">
-            <Shield className="w-8 h-8" />
-          </div>
-          <h1 className="text-2xl font-bold tracking-tight text-white">SprintVault</h1>
-          <p className="text-xs text-slate-400 max-w-sm mx-auto">
-            Task-governed Scrum app with exclusive file locking and native Git integration.
-          </p>
-        </div>
-
-        {/* Login Form Box */}
-        <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-6 shadow-2xl space-y-5">
-          {error && (
-            <div className="bg-rose-950/70 border border-rose-800 text-rose-200 text-xs p-3 rounded-lg flex items-center space-x-2">
-              <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
-              <span>{error}</span>
-            </div>
-          )}
-
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div>
-              <label className="text-xs font-medium text-slate-300 block mb-1">
-                Email Address
-              </label>
-              <div className="relative">
-                <Mail className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
-                <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  required
-                  placeholder="lead@sprintvault.com"
-                  className="w-full bg-slate-950 text-xs text-white pl-9 pr-3 py-2 rounded-lg border border-slate-700 focus:outline-none focus:border-blue-500"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="text-xs font-medium text-slate-300 block mb-1">
-                Password
-              </label>
-              <div className="relative">
-                <Lock className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  required
-                  placeholder="password123"
-                  className="w-full bg-slate-950 text-xs text-white pl-9 pr-3 py-2 rounded-lg border border-slate-700 focus:outline-none focus:border-blue-500"
-                />
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full flex items-center justify-center space-x-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold py-2.5 rounded-lg transition shadow-lg shadow-blue-900/30 disabled:opacity-50"
-            >
-              <span>{loading ? 'Authenticating...' : 'Sign In'}</span>
-              <ArrowRight className="w-4 h-4" />
-            </button>
-          </form>
-
-          {/* 5 Users Quick Switcher Section */}
-          <div className="pt-4 border-t border-slate-800 space-y-2.5">
-            <div className="flex items-center justify-between text-[11px] text-slate-400">
-              <span className="font-semibold uppercase tracking-wider text-[10px]">
-                5-User Scrum Team (1 TL + 4 Devs)
-              </span>
-              <span>1-Click Login</span>
-            </div>
-
-            <div className="space-y-1.5">
-              {allUsers.map((u) => {
-                const isTL = u.role === UserRole.MANAGER;
-                return (
-                  <button
-                    key={u.user_id}
-                    type="button"
-                    onClick={() => handleQuickLogin(u.email)}
-                    className="w-full text-left p-2 rounded-lg bg-slate-950/60 hover:bg-slate-800 border border-slate-800/80 hover:border-slate-700 flex items-center justify-between transition text-xs group"
-                  >
-                    <div className="flex items-center space-x-2 truncate">
-                      <span
-                        className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                          isTL
-                            ? 'bg-amber-950 text-amber-300 border border-amber-800'
-                            : 'bg-slate-800 text-slate-300 border border-slate-700'
-                        }`}
-                      >
-                        {isTL ? 'TEAM LEAD' : 'DEV'}
-                      </span>
-                      <span className="text-slate-200 group-hover:text-white truncate font-medium">
-                        {u.name}
-                      </span>
-                    </div>
-                    <span className="text-[10px] text-slate-500 font-mono">{u.email}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-
-        <div className="text-center text-[11px] text-slate-500">
-          Strict Scrum Workflow: Managers assign • Devs lock scope • Pushes complete tasks
-        </div>
+    <main className="mx-auto grid min-h-screen max-w-5xl content-center gap-16 px-6 py-16 md:grid-cols-[1.1fr_1fr]">
+      <div className="self-center">
+        <p className="font-display text-[clamp(40px,7vw,76px)] leading-[0.95] text-slate-50">SprintVault</p>
+        <p className="mt-6 max-w-sm text-base text-slate-400">
+          Scrum tasks that lock the code they touch. Start a task and its files are yours until you commit.
+        </p>
       </div>
-    </div>
+
+      <div className="w-full max-w-sm">
+        <h1 className="text-lg font-semibold text-slate-50">Sign in</h1>
+
+        <form
+          className="mt-6 space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            attempt(() => login(email, password));
+          }}
+        >
+          {error && <Notice>{error}</Notice>}
+          <Field label="Email" htmlFor="email">
+            <input
+              id="email"
+              type="email"
+              autoComplete="username"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className={`${inputClass} h-10`}
+            />
+          </Field>
+          <Field label="Password" htmlFor="password">
+            <input
+              id="password"
+              type="password"
+              autoComplete="current-password"
+              required
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className={`${inputClass} h-10`}
+            />
+          </Field>
+          <Button type="submit" variant="primary" block disabled={loading} className="h-10">
+            {loading ? 'Signing in…' : 'Sign in'}
+          </Button>
+        </form>
+
+        {demoMode && (
+          <div className="mt-10">
+            <h2 className="text-sm text-slate-400">Demo accounts</h2>
+            <ul className="mt-2 divide-y divide-slate-800 border-y border-slate-800">
+              {demoUsers.map((u) => (
+                <li key={u.user_id}>
+                  <button
+                    type="button"
+                    disabled={loading}
+                    onClick={() => {
+                      setEmail(u.email);
+                      attempt(() => switchUser(u.email));
+                    }}
+                    className="flex w-full items-baseline justify-between py-2 text-left text-sm text-slate-200 hover:text-blue-300"
+                  >
+                    {u.name.replace(/\s*\(Team Lead\)$/, '')}
+                    <span className="text-xs text-slate-500">{u.role === UserRole.MANAGER ? 'Team lead' : 'Developer'}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </main>
   );
 };

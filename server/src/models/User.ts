@@ -1,9 +1,27 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { db } from '../db/database';
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { db, DB_PATH } from '../db/database';
 import { UserRole, UserRow } from '../types';
 
-export const JWT_SECRET = process.env.JWT_SECRET || 'sprintvault-super-secret-key-1234';
+/**
+ * JWT secret: JWT_SECRET env var, otherwise a random per-install secret persisted next to the database.
+ */
+function resolveJwtSecret(): string {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  const secretFile = path.join(path.dirname(DB_PATH), '.sprintvault-jwt-secret');
+  if (fs.existsSync(secretFile)) return fs.readFileSync(secretFile, 'utf8').trim();
+  const secret = crypto.randomBytes(48).toString('hex');
+  fs.writeFileSync(secretFile, secret, { encoding: 'utf8', mode: 0o600 });
+  return secret;
+}
+
+export const JWT_SECRET = resolveJwtSecret();
+
+// Revoked token ids (jti) -> expiry (epoch seconds). Entries are dropped once the token would have expired anyway.
+const revokedTokens = new Map<string, number>();
 
 export abstract class User {
   public userId: number;
@@ -25,7 +43,7 @@ export abstract class User {
   }
 
   static findByEmail(email: string): User | null {
-    const row = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as UserRow | undefined;
+    const row = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(email) as UserRow | undefined;
     if (!row) return null;
     return User.fromRow(row);
   }
@@ -39,7 +57,7 @@ export abstract class User {
   }
 
   static login(email: string, password: string): { user: User; token: string } | null {
-    const row = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as UserRow | undefined;
+    const row = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(email.trim()) as UserRow | undefined;
     if (!row) return null;
 
     const matches = bcrypt.compareSync(password, row.password_hash);
@@ -49,9 +67,21 @@ export abstract class User {
     const token = jwt.sign(
       { userId: user.userId, name: user.name, email: user.email, role: user.role },
       JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '12h', jwtid: crypto.randomUUID() }
     );
     return { user, token };
+  }
+
+  static revokeToken(jti: string, expiresAt: number): void {
+    const now = Math.floor(Date.now() / 1000);
+    for (const [id, exp] of revokedTokens) {
+      if (exp < now) revokedTokens.delete(id);
+    }
+    revokedTokens.set(jti, expiresAt);
+  }
+
+  static isTokenRevoked(jti: string | undefined): boolean {
+    return !!jti && revokedTokens.has(jti);
   }
 
   logout(): boolean {

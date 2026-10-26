@@ -21,11 +21,13 @@ export class LockManager {
         return { lock: null, reason: 'Task already has an active lock' };
       }
 
-      // 2. Fetch all currently active locks across the system
+      // 2. Fetch all currently active locks in the same project (scopes are paths within one repository)
       const activeRows = db.prepare(`
-        SELECT * FROM file_locks
-        WHERE status = ?
-      `).all(LockStatus.ACTIVE) as unknown as FileLockRow[];
+        SELECT fl.* FROM file_locks fl
+        JOIN tasks t ON fl.task_id = t.task_id
+        WHERE fl.status = ?
+          AND t.project_id = (SELECT project_id FROM tasks WHERE task_id = ?)
+      `).all(LockStatus.ACTIVE, taskId) as unknown as FileLockRow[];
 
       // 3. Overlap check against all active locks
       for (const row of activeRows) {

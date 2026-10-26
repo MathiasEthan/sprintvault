@@ -3,6 +3,16 @@ import { ActionType, ActivityLogRow, UserRole } from '../types';
 import { DeveloperStats } from './DeveloperStats';
 import { User } from './User';
 
+// Project an activity belongs to: ref is a projectId (PULL), a commit SHA (PUSH) or a taskId (LOCK / FORCE_UNLOCK)
+const PROJECT_ID_SQL = `
+  CASE a.action
+    WHEN 'PULL' THEN CAST(a.ref AS INTEGER)
+    WHEN 'PUSH' THEN (SELECT t.project_id FROM tasks t WHERE t.commit_sha = a.ref LIMIT 1)
+    ELSE (SELECT t.project_id FROM tasks t WHERE t.task_id = CAST(a.ref AS INTEGER))
+  END`;
+
+type ActivityRowWithUser = ActivityLogRow & { user_name: string; user_role: string; project_id: number | null };
+
 export class ActivityLog {
   public logId: number;
   public userId: number;
@@ -54,26 +64,39 @@ export class ActivityLog {
     return new ActivityLog(logId, userId, action, refStr, now);
   }
 
-  static findAll(limit: number = 50): Array<ActivityLogRow & { user_name: string; user_role: string }> {
+  static findAll(limit: number = 50): ActivityRowWithUser[] {
     const rows = db.prepare(`
-      SELECT a.*, u.name as user_name, u.role as user_role
+      SELECT a.*, u.name as user_name, u.role as user_role, ${PROJECT_ID_SQL} as project_id
       FROM activity_log a
       JOIN users u ON a.user_id = u.user_id
       ORDER BY a.log_id DESC
       LIMIT ?
-    `).all(limit) as unknown as Array<ActivityLogRow & { user_name: string; user_role: string }>;
+    `).all(limit) as unknown as ActivityRowWithUser[];
     return rows;
   }
 
-  static findByUserId(userId: number, limit: number = 50): Array<ActivityLogRow & { user_name: string; user_role: string }> {
+  static findByUserId(userId: number, limit: number = 50): ActivityRowWithUser[] {
     const rows = db.prepare(`
-      SELECT a.*, u.name as user_name, u.role as user_role
+      SELECT a.*, u.name as user_name, u.role as user_role, ${PROJECT_ID_SQL} as project_id
       FROM activity_log a
       JOIN users u ON a.user_id = u.user_id
       WHERE a.user_id = ?
       ORDER BY a.log_id DESC
       LIMIT ?
-    `).all(userId, limit) as unknown as Array<ActivityLogRow & { user_name: string; user_role: string }>;
+    `).all(userId, limit) as unknown as ActivityRowWithUser[];
     return rows;
+  }
+
+  static findByProjectId(projectId: number, limit: number = 50): ActivityRowWithUser[] {
+    return db.prepare(`
+      SELECT * FROM (
+        SELECT a.*, u.name as user_name, u.role as user_role, ${PROJECT_ID_SQL} as project_id
+        FROM activity_log a
+        JOIN users u ON a.user_id = u.user_id
+      )
+      WHERE project_id = ?
+      ORDER BY log_id DESC
+      LIMIT ?
+    `).all(projectId, limit) as unknown as ActivityRowWithUser[];
   }
 }

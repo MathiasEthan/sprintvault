@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import JSZip from 'jszip';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { Navbar } from './components/Navbar';
 import { ScrumBoard } from './components/ScrumBoard';
@@ -14,8 +15,30 @@ import { UploadProjectModal } from './components/UploadProjectModal';
 import { CommitDiffModal } from './components/CommitDiffModal';
 import { PushWorkbench } from './components/PushWorkbench';
 import { api } from './api';
-import { Task, Project, TaskStatus } from './types';
-import { AlertCircle, CheckCircle2, Info, FolderGit2, HardDrive, GitBranch } from 'lucide-react';
+import { Task, Project, TaskStatus, GitMetadata, GitFileItem } from './types';
+import { Button, Code, Modal, PageHeader } from './components/ui';
+
+const POLL_INTERVAL_MS = 4000;
+
+/**
+ * Pull = download (LOGIC §4.2): package the snapshot as a .zip and hand it to the browser.
+ */
+async function downloadSnapshot(projectName: string, snapshot: GitFileItem[], scope: string[]) {
+  const zip = new JSZip();
+  for (const file of snapshot) {
+    zip.file(file.path, file.content);
+  }
+  const blob = await zip.generateAsync({ type: 'blob' });
+  const scopeLabel = scope.length ? scope.join('_').replace(/[^a-zA-Z0-9_-]+/g, '-') : 'all';
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${projectName.replace(/[^a-zA-Z0-9_-]+/g, '-')}-${scopeLabel}.zip`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 function AppContent() {
   const { currentUser, allUsers, loading: authLoading } = useAuth();
@@ -30,7 +53,15 @@ function AppContent() {
   const [createTaskOpen, setCreateTaskOpen] = useState<boolean>(false);
   const [createProjectOpen, setCreateProjectOpen] = useState<boolean>(false);
   const [uploadProjectOpen, setUploadProjectOpen] = useState<boolean>(false);
-  const [activeDiffSha, setActiveDiffSha] = useState<string | null>(null);
+  const [activeDiff, setActiveDiff] = useState<{ sha: string; projectId: number | null } | null>(null);
+  const openCommitDetails = (sha: string, projectId?: number | null) =>
+    setActiveDiff({ sha, projectId: projectId ?? selectedProjectId });
+
+  // Live sync: poll the server's change marker and refresh views when anyone changes the Scrum
+  const [connected, setConnected] = useState<boolean>(true);
+  const [refreshKey, setRefreshKey] = useState<number>(0);
+  const lastVersion = useRef<number | null>(null);
+  const [projectMeta, setProjectMeta] = useState<GitMetadata | null>(null);
 
   // Commit Done modal state
   const [commitDoneTask, setCommitDoneTask] = useState<Task | null>(null);
@@ -39,9 +70,11 @@ function AppContent() {
   // Global notification banner
   const [banner, setBanner] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
 
+  const bannerTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showBanner = (type: 'success' | 'error' | 'info', message: string) => {
     setBanner({ type, message });
-    setTimeout(() => setBanner(null), 6000);
+    if (bannerTimer.current) clearTimeout(bannerTimer.current);
+    bannerTimer.current = setTimeout(() => setBanner(null), 6000);
   };
 
   // Load projects
@@ -58,8 +91,8 @@ function AppContent() {
   };
 
   // Load tasks for active project
-  const loadTasks = async () => {
-    setLoadingTasks(true);
+  const loadTasks = async (background = false) => {
+    if (!background) setLoadingTasks(true);
     try {
       const res = await api.getTasks(selectedProjectId || undefined);
       setTasks(res.tasks);
@@ -82,11 +115,44 @@ function AppContent() {
     }
   }, [currentUser?.userId, selectedProjectId]);
 
+  // Real .git / .scrum.json status for the selected project
+  useEffect(() => {
+    if (!currentUser || !selectedProjectId) return;
+    api.getGitMetadata(selectedProjectId)
+      .then((res) => setProjectMeta(res.metadata))
+      .catch(() => setProjectMeta(null));
+  }, [currentUser?.userId, selectedProjectId, refreshKey]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    let cancelled = false;
+    const poll = async () => {
+      if (document.hidden) return;
+      try {
+        const { version } = await api.getChanges();
+        if (cancelled) return;
+        setConnected(true);
+        if (lastVersion.current !== null && version !== lastVersion.current) {
+          loadProjects();
+          if (selectedProjectId) loadTasks(true);
+          setRefreshKey((k) => k + 1);
+        }
+        lastVersion.current = version;
+      } catch {
+        if (!cancelled) setConnected(false);
+      }
+    };
+    poll();
+    const timer = setInterval(poll, POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [currentUser?.userId, selectedProjectId]);
+
   if (authLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-950 text-slate-400">
-        <div className="text-sm">Initializing SprintVault...</div>
-      </div>
+      <p className="px-6 py-16 text-sm text-slate-500">Loading…</p>
     );
   }
 
@@ -100,7 +166,7 @@ function AppContent() {
   const handleStartWork = async (taskId: number) => {
     try {
       await api.startWork(taskId);
-      showBanner('success', `Lock acquired on Task #${taskId}! Task is now IN_PROGRESS.`);
+      showBanner('success', `Started #${taskId}. Its scope is locked to you.`);
       await loadTasks();
     } catch (err: any) {
       showBanner('error', err.message);
@@ -112,7 +178,7 @@ function AppContent() {
   };
 
   const handleCommitDoneSuccess = async (sha: string) => {
-    showBanner('success', `Commit linked (${sha.substring(0, 7)})! Task completed & file lock released.`);
+    showBanner('success', `Linked ${sha.substring(0, 7)}. The task is done and its lock is released.`);
     await loadTasks();
     await loadProjects();
   };
@@ -120,7 +186,7 @@ function AppContent() {
   const handleAssignTask = async (taskId: number, devId: number) => {
     try {
       await api.assignTask(taskId, devId);
-      showBanner('success', `Task #${taskId} assigned.`);
+      showBanner('success', `Assigned #${taskId}.`);
       await loadTasks();
     } catch (err: any) {
       showBanner('error', err.message);
@@ -130,7 +196,7 @@ function AppContent() {
   const handleForceRelease = async (taskId: number) => {
     try {
       await api.forceRelease(taskId);
-      showBanner('info', `Lock revoked on Task #${taskId}. Reset to ASSIGNED.`);
+      showBanner('info', `Released the lock on #${taskId}. It is back in Assigned.`);
       await loadTasks();
     } catch (err: any) {
       showBanner('error', err.message);
@@ -146,7 +212,7 @@ function AppContent() {
 
   const handleCreateProject = async (name: string, repoUrl: string, defaultBranch: string, memberIds: number[]) => {
     const res = await api.createProject(name, repoUrl, defaultBranch, memberIds);
-    showBanner('success', `Project '${name}' created!`);
+    showBanner('success', `Created ${name}.`);
     await loadProjects();
     setSelectedProjectId(res.project.projectId);
     setCurrentTab('board');
@@ -156,14 +222,42 @@ function AppContent() {
     if (!selectedProjectId) return;
     try {
       const res = await api.pullCode(selectedProjectId, scope);
-      showBanner('success', `Snapshot of ${res.snapshot.length} files pulled. Developer pull counter +1.`);
+      await downloadSnapshot(selectedProject?.name || 'project', res.snapshot, scope);
+      showBanner('success', `Downloaded ${res.snapshot.length} ${res.snapshot.length === 1 ? 'file' : 'files'}.`);
     } catch (err: any) {
       showBanner('error', err.message);
     }
   };
 
+  const projectHeader = selectedProject && (currentTab === 'board' || currentTab === 'graph' || currentTab === 'inspector') && (
+    <PageHeader
+      title={selectedProject.name}
+      meta={
+        <>
+          <span>
+            Branch <Code className="text-slate-300">{selectedProject.defaultBranch}</Code>
+          </span>
+          {projectMeta && <span className="tabular">{projectMeta.totalCommits} commits</span>}
+          {projectMeta && !projectMeta.gitDirExists && <span className="text-rose-300">Repository folder missing</span>}
+          {projectMeta?.hasUncommittedChanges && <span className="text-amber-300">Uncommitted changes on the server</span>}
+        </>
+      }
+      actions={
+        currentTab === 'board' &&
+        currentUser.role === 'MANAGER' && (
+          <Button variant="primary" onClick={() => setCreateTaskOpen(true)}>
+            New task
+          </Button>
+        )
+      }
+    />
+  );
+
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
+    <div className="flex min-h-screen flex-col">
+      <a href="#main" className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-2 focus:z-50 focus:bg-slate-900 focus:px-3 focus:py-2">
+        Skip to content
+      </a>
       <Navbar
         currentTab={currentTab}
         setCurrentTab={setCurrentTab}
@@ -171,69 +265,21 @@ function AppContent() {
         selectedProjectId={selectedProjectId}
         onSelectProject={(id) => setSelectedProjectId(id)}
         onOpenUploadModal={() => setUploadProjectOpen(true)}
+        connected={connected}
       />
 
-      {/* Global alert banner */}
-      {banner && (
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 w-full mt-4">
-          <div
-            className={`p-3 rounded-lg border text-xs flex items-center justify-between shadow-lg ${
-              banner.type === 'success'
-                ? 'bg-emerald-950/80 border-emerald-700 text-emerald-200'
-                : banner.type === 'error'
-                ? 'bg-rose-950/80 border-rose-700 text-rose-200'
-                : 'bg-blue-950/80 border-blue-700 text-blue-200'
-            }`}
-          >
-            <div className="flex items-center space-x-2">
-              {banner.type === 'success' && <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />}
-              {banner.type === 'error' && <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />}
-              {banner.type === 'info' && <Info className="w-4 h-4 text-blue-400 flex-shrink-0" />}
-              <span>{banner.message}</span>
-            </div>
-            <button onClick={() => setBanner(null)} className="text-slate-400 hover:text-white text-xs ml-4">
-              ✕
+      <main id="main" className="mx-auto w-full max-w-7xl flex-1 px-4 py-8 sm:px-6">
+        {currentTab !== 'projects' && currentTab !== 'dashboard' && !selectedProject && (
+          <p className="text-sm text-slate-400">
+            No project selected.{' '}
+            <button className="text-blue-300 underline underline-offset-2" onClick={() => setCurrentTab('projects')}>
+              Open the project list
             </button>
-          </div>
-        </div>
-      )}
+          </p>
+        )}
 
-      {/* Per-Project Active Banner (when inside a project view) */}
-      {selectedProject && currentTab !== 'projects' && (
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 w-full pt-4">
-          <div className="bg-slate-900/60 border border-slate-800 rounded-xl px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs">
-            <div className="flex items-center space-x-3">
-              <span className="font-bold text-white flex items-center gap-1.5">
-                <FolderGit2 className="w-4 h-4 text-blue-400" />
-                <span>{selectedProject.name}</span>
-              </span>
+        {projectHeader}
 
-              <span className="text-[11px] font-mono bg-slate-800 text-slate-300 px-2 py-0.5 rounded border border-slate-700 flex items-center gap-1">
-                <GitBranch className="w-3 h-3 text-blue-400" />
-                <span>{selectedProject.defaultBranch}</span>
-              </span>
-
-              <span className="text-[11px] text-slate-400 font-mono hidden md:inline truncate max-w-sm">
-                {selectedProject.repoPath || selectedProject.repoUrl}
-              </span>
-            </div>
-
-            <div className="flex items-center space-x-2">
-              <span className="text-[10px] bg-emerald-950/60 text-emerald-300 border border-emerald-800/60 px-2 py-0.5 rounded-full flex items-center gap-1">
-                <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                <span>.git folder</span>
-              </span>
-              <span className="text-[10px] bg-blue-950/60 text-blue-300 border border-blue-800/60 px-2 py-0.5 rounded-full flex items-center gap-1">
-                <HardDrive className="w-3 h-3 text-blue-400" />
-                <span>.scrum.json</span>
-              </span>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Main Content Body */}
-      <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 w-full">
         {currentTab === 'projects' && (
           <ProjectHub
             projects={projects}
@@ -246,18 +292,16 @@ function AppContent() {
           />
         )}
 
-        {currentTab === 'board' && (
+        {currentTab === 'board' && selectedProject && (
           <ScrumBoard
             tasks={tasks}
             users={allUsers}
             onStartWork={handleStartWork}
             onOpenCommitDone={handleOpenCommitDone}
-            onOpenPushModal={(task) => {
-              setWorkbenchTask(task);
-            }}
+            onOpenPushModal={(task) => setWorkbenchTask(task)}
             onAssignTask={handleAssignTask}
             onForceRelease={handleForceRelease}
-            onOpenCommitDetails={(sha) => setActiveDiffSha(sha)}
+            onOpenCommitDetails={(sha) => openCommitDetails(sha)}
             onCreateTaskClick={() => setCreateTaskOpen(true)}
             onPullCodeClick={handlePullScope}
             onViewCommitGraphClick={() => setCurrentTab('graph')}
@@ -265,30 +309,36 @@ function AppContent() {
         )}
 
         {currentTab === 'graph' && selectedProjectId && (
-          <GitCommitGraph
-            projectId={selectedProjectId}
-            onOpenCommitDetails={(sha) => setActiveDiffSha(sha)}
-          />
+          <GitCommitGraph projectId={selectedProjectId} onOpenCommitDetails={(sha) => openCommitDetails(sha)} refreshKey={refreshKey} />
         )}
 
         {currentTab === 'inspector' && selectedProject && (
-          <GitInspector
-            project={selectedProject}
-            onPullScope={handlePullScope}
-          />
+          <GitInspector project={selectedProject} onPullScope={handlePullScope} refreshKey={refreshKey} />
         )}
 
-        {currentTab === 'dashboard' && (
-          <DashboardView onOpenCommitDetails={(sha) => setActiveDiffSha(sha)} />
-        )}
+        {currentTab === 'dashboard' && <DashboardView onOpenCommitDetails={openCommitDetails} refreshKey={refreshKey} />}
       </main>
 
-      {/* Modals */}
+      {/* Toast: answers the user's last action */}
+      {banner && (
+        <div
+          role={banner.type === 'error' ? 'alert' : 'status'}
+          className={`fixed bottom-5 left-1/2 z-50 flex w-[min(560px,calc(100%-2rem))] -translate-x-1/2 items-start gap-4 rounded-md border border-slate-800 border-l-[3px] bg-slate-900 px-4 py-3 text-sm text-slate-100 ${
+            banner.type === 'error' ? 'border-l-rose-500' : banner.type === 'success' ? 'border-l-blue-500' : 'border-l-slate-500'
+          }`}
+        >
+          <span className="flex-1">{banner.message}</span>
+          <button onClick={() => setBanner(null)} className="text-slate-500 hover:text-slate-100" aria-label="Dismiss">
+            Dismiss
+          </button>
+        </div>
+      )}
+
       <CommitDoneModal
         isOpen={!!commitDoneTask}
         onClose={() => setCommitDoneTask(null)}
         task={commitDoneTask}
-        projectId={selectedProjectId || 1}
+        projectId={commitDoneTask?.project_id ?? selectedProjectId ?? 0}
         onSuccess={handleCommitDoneSuccess}
       />
 
@@ -297,7 +347,7 @@ function AppContent() {
         onClose={() => setUploadProjectOpen(false)}
         users={allUsers}
         onSuccess={async (projectId) => {
-          showBanner('success', 'Project added successfully!');
+          showBanner('success', 'Project imported.');
           await loadProjects();
           setSelectedProjectId(projectId);
           setCurrentTab('board');
@@ -312,38 +362,23 @@ function AppContent() {
         onSubmit={handleCreateTask}
       />
 
-      <CreateProjectModal
-        isOpen={createProjectOpen}
-        onClose={() => setCreateProjectOpen(false)}
-        users={allUsers}
-        onSubmit={handleCreateProject}
-      />
+      <CreateProjectModal isOpen={createProjectOpen} onClose={() => setCreateProjectOpen(false)} users={allUsers} onSubmit={handleCreateProject} />
 
-      <CommitDiffModal
-        projectId={selectedProjectId}
-        sha={activeDiffSha}
-        onClose={() => setActiveDiffSha(null)}
-      />
+      <CommitDiffModal projectId={activeDiff?.projectId ?? null} sha={activeDiff?.sha ?? null} onClose={() => setActiveDiff(null)} />
 
       {workbenchTask && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-4xl w-full max-h-[90vh] overflow-y-auto p-6 shadow-2xl space-y-4">
-            <div className="flex justify-between items-center border-b border-slate-800 pb-3">
-              <h3 className="text-base font-bold text-white">Browser Push Workbench (Alternative to Local Git)</h3>
-              <button onClick={() => setWorkbenchTask(null)} className="text-slate-400 hover:text-white">✕</button>
-            </div>
-            <PushWorkbench
-              tasks={tasks}
-              selectedTask={workbenchTask}
-              onPushComplete={async () => {
-                showBanner('success', 'Pushed & task completed!');
-                await loadTasks();
-                setWorkbenchTask(null);
-              }}
-              onOpenCommitDetails={(sha) => setActiveDiffSha(sha)}
-            />
-          </div>
-        </div>
+        <Modal title="Edit in browser" description="For quick changes. For real work, commit from your editor and use Commit done." onClose={() => setWorkbenchTask(null)} wide>
+          <PushWorkbench
+            tasks={tasks}
+            selectedTask={workbenchTask}
+            onPushComplete={async () => {
+              showBanner('success', `Committed. Task #${workbenchTask.task_id} is done and its lock is released.`);
+              await loadTasks();
+              setWorkbenchTask(null);
+            }}
+            onOpenCommitDetails={(sha) => openCommitDetails(sha, workbenchTask.project_id)}
+          />
+        </Modal>
       )}
     </div>
   );

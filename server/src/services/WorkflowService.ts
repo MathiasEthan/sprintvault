@@ -1,19 +1,49 @@
+import fs from 'fs';
 import { db } from '../db/database';
 import { Project } from '../models/Project';
 import { Task } from '../models/Task';
 import { FileLock } from '../models/FileLock';
 import { ActivityLog } from '../models/ActivityLog';
-import { DeveloperStats } from '../models/DeveloperStats';
 import { User } from '../models/User';
 import { LockManager } from './LockManager';
 import { GitService } from './GitService';
-import { GitHost } from './GitHost';
 import { ScrumFileService } from './ScrumFileService';
+import { ChangeFeed } from './ChangeFeed';
 import { ActionType, GitFileItem, TaskStatus, UserRole, GitGraphNode, GitMetadata } from '../types';
+import { ValidationError, normalizeScopePaths, requireText, validatePushFiles } from '../validation';
 
 export class WorkflowService {
   /**
+   * Writes .scrum.json, commits it as the service account and publishes it to origin,
+   * so every clone of the project sees the Scrum change on `git pull`.
+   */
+  static recordScrumChange(projectId: number, message: string): void {
+    const project = Project.findById(projectId);
+    if (!project) return;
+    const git = GitService.forProject(project);
+    ScrumFileService.syncProjectScrumFile(projectId, git.repoPath);
+    git.recordScrumChange(`chore(scrum): ${message}`);
+    ChangeFeed.bump();
+  }
+
+  private static requireManager(userId: number): User {
+    const user = User.findById(userId);
+    if (!user || user.role !== UserRole.MANAGER) {
+      throw new Error('access denied');
+    }
+    return user;
+  }
+
+  private static requireDeveloper(devId: number): void {
+    const user = User.findById(devId);
+    if (!user || user.role !== UserRole.DEVELOPER) {
+      throw new ValidationError(`User #${devId} is not a developer`);
+    }
+  }
+
+  /**
    * UC-02: createProject (Manager only)
+   * Atomic: if the repository cannot be created/populated, the project row and directory are removed.
    */
   static createProject(
     name: string,
@@ -21,48 +51,70 @@ export class WorkflowService {
     defaultBranch: string = 'main',
     createdBy: number,
     initialMemberIds: number[] = [],
-    customPath?: string
+    customPath?: string,
+    populate?: (repoPath: string) => void
   ): Project {
-    const user = User.findById(createdBy);
-    if (!user || user.role !== UserRole.MANAGER) {
-      throw new Error('access denied');
+    WorkflowService.requireManager(createdBy);
+    const cleanName = requireText(name, 'Project name');
+    const cleanUrl = requireText(repoUrl, 'Repository URL', 1000);
+    const branch = requireText(defaultBranch, 'Default branch', 100);
+    if (!GitService.isValidBranchName(branch)) {
+      throw new ValidationError(`'${branch}' is not a valid branch name`);
     }
+    initialMemberIds.forEach((devId) => WorkflowService.requireDeveloper(devId));
 
-    const res = db.prepare(`
-      INSERT INTO projects (name, repo_url, default_branch, created_by)
-      VALUES (?, ?, ?, ?)
-    `).run(name, repoUrl, defaultBranch, createdBy);
+    let project: Project;
+    let repoPath = '';
+    let createdDir = false;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const res = db.prepare(`
+        INSERT INTO projects (name, repo_url, default_branch, created_by)
+        VALUES (?, ?, ?, ?)
+      `).run(cleanName, cleanUrl, branch, createdBy);
 
-    const projectId = Number(res.lastInsertRowid);
-    const project = new Project(projectId, name, repoUrl, defaultBranch, createdBy);
+      const projectId = Number(res.lastInsertRowid);
+      project = new Project(projectId, cleanName, cleanUrl, branch, createdBy);
 
-    const repoPath = customPath || GitService.getProjectRepoPath(projectId);
-    GitHost.ensureRepo(repoPath, defaultBranch, [
-      {
-        path: 'README.md',
-        content: `# ${name}\n\nManaged by SprintVault Scrum App.\n`,
-      },
-      {
-        path: 'src/main.ts',
-        content: `// Entry point for ${name}\nconsole.log('SprintVault project active.');\n`,
-      },
-      {
-        path: 'src/auth/auth.ts',
-        content: `// Authentication module\nexport function verifyToken(token: string) {\n  return token.length > 0;\n}\n`,
-      },
-    ]);
+      repoPath = customPath || GitService.getProjectRepoPath(projectId);
+      createdDir = !fs.existsSync(repoPath);
+      fs.mkdirSync(repoPath, { recursive: true });
+      if (populate) populate(repoPath);
 
-    // Add initial project members
-    if (initialMemberIds && initialMemberIds.length > 0) {
+      // Starter files only for brand-new, empty projects: imports and uploads keep their own contents
+      const starterFiles = customPath || populate ? [] : [
+        { path: 'README.md', content: `# ${cleanName}\n\nManaged by SprintVault Scrum App.\n` },
+        { path: 'src/main.ts', content: `// Entry point for ${cleanName}\nconsole.log('SprintVault project active.');\n` },
+        { path: 'src/auth/auth.ts', content: `// Authentication module\nexport function verifyToken(token: string) {\n  return token.length > 0;\n}\n` },
+      ];
+      const git = new GitService(repoPath, branch);
+      git.initialize(GitService.remoteUrlFor(cleanUrl), starterFiles);
+
       for (const devId of initialMemberIds) {
         project.addMember(devId);
       }
+      db.exec('COMMIT');
+    } catch (err) {
+      try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      if (createdDir && repoPath) fs.rmSync(repoPath, { recursive: true, force: true });
+      throw err;
     }
 
-    // Sync .scrum.json in project root
-    ScrumFileService.syncProjectScrumFile(projectId, repoPath);
-
+    WorkflowService.recordScrumChange(project.projectId, `create project '${cleanName}'`);
     return project;
+  }
+
+  /**
+   * Project.addMember (Manager only)
+   */
+  static addMember(projectId: number, devId: number, managerId: number): number[] {
+    WorkflowService.requireManager(managerId);
+    const project = Project.findById(projectId);
+    if (!project) throw new ValidationError('Project not found');
+    WorkflowService.requireDeveloper(devId);
+    project.addMember(devId);
+    WorkflowService.recordScrumChange(projectId, `add member #${devId}`);
+    return project.getMembers();
   }
 
   /**
@@ -74,44 +126,40 @@ export class WorkflowService {
     scopePaths: string[],
     createdBy: number
   ): Task {
-    const user = User.findById(createdBy);
-    if (!user || user.role !== UserRole.MANAGER) {
-      throw new Error('access denied');
-    }
+    WorkflowService.requireManager(createdBy);
+    const cleanTitle = requireText(title, 'Title');
+    const scopes = normalizeScopePaths(scopePaths);
 
     const project = Project.findById(projectId);
     if (!project) {
       throw new Error('Project not found');
     }
 
-    const scopeJson = JSON.stringify(scopePaths);
     const res = db.prepare(`
       INSERT INTO tasks (project_id, title, scope_paths, status, assignee_id, commit_sha, completed_at)
       VALUES (?, ?, ?, ?, NULL, NULL, NULL)
-    `).run(projectId, title, scopeJson, TaskStatus.CREATED);
+    `).run(projectId, cleanTitle, JSON.stringify(scopes), TaskStatus.CREATED);
 
     const taskId = Number(res.lastInsertRowid);
-    const task = new Task(taskId, projectId, title, scopePaths, TaskStatus.CREATED);
+    const task = new Task(taskId, projectId, cleanTitle, scopes, TaskStatus.CREATED);
 
-    // Sync .scrum.json
-    const repoPath = GitService.getProjectRepoPath(projectId);
-    ScrumFileService.syncProjectScrumFile(projectId, repoPath);
-
+    WorkflowService.recordScrumChange(projectId, `create task #${taskId} '${cleanTitle}'`);
     return task;
   }
 
   /**
-   * UC-04: assignTask (Manager only)
+   * UC-04: assignTask (Manager only) — allowed only from CREATED / ASSIGNED (LOGIC §2)
    */
   static assignTask(taskId: number, devId: number, managerId: number): Task {
-    const user = User.findById(managerId);
-    if (!user || user.role !== UserRole.MANAGER) {
-      throw new Error('access denied');
-    }
+    WorkflowService.requireManager(managerId);
 
     const task = Task.findById(taskId);
     if (!task) {
       throw new Error('Task not found');
+    }
+
+    if (task.status !== TaskStatus.CREATED && task.status !== TaskStatus.ASSIGNED) {
+      throw new ValidationError(`Task cannot be assigned from status '${task.status}'`);
     }
 
     const project = Project.findById(task.projectId);
@@ -119,31 +167,38 @@ export class WorkflowService {
       throw new Error('Project not found');
     }
 
+    WorkflowService.requireDeveloper(devId);
     if (!project.isMember(devId)) {
-      throw new Error('Developer is not a member of this project');
+      throw new ValidationError('Developer is not a member of this project');
     }
 
     task.assign(devId);
-
-    // Sync .scrum.json
-    const repoPath = GitService.getProjectRepoPath(project.projectId);
-    ScrumFileService.syncProjectScrumFile(project.projectId, repoPath);
-
+    WorkflowService.recordScrumChange(project.projectId, `assign task #${taskId} to user #${devId}`);
     return task;
   }
 
   /**
-   * UC-05: browseFiles (Read-only)
+   * UC-05: browseFiles (Read-only). Developers may only browse projects they belong to.
    */
-  static browseFiles(projectId: number, branch?: string, scope?: string[]): GitFileItem[] {
+  static browseFiles(projectId: number, branch?: string, scope?: string[], requesterId?: number): GitFileItem[] {
     const project = Project.findById(projectId);
     if (!project) {
       throw new Error('Project not found');
     }
+    if (requesterId !== undefined) {
+      WorkflowService.assertCanView(project, requesterId);
+    }
 
-    const repoPath = GitService.getProjectRepoPath(projectId);
-    const gitService = new GitService(repoPath, branch || project.defaultBranch);
-    return gitService.fetch(scope || []);
+    const git = new GitService(GitService.getProjectRepoPath(projectId), branch || project.defaultBranch);
+    return git.fetch(scope || []);
+  }
+
+  static assertCanView(project: Project, userId: number): void {
+    const user = User.findById(userId);
+    if (!user) throw new Error('access denied');
+    if (user.role === UserRole.DEVELOPER && !project.isMember(userId)) {
+      throw new Error('access denied');
+    }
   }
 
   /**
@@ -173,10 +228,7 @@ export class WorkflowService {
     task.start();
     ActivityLog.record(devId, ActionType.LOCK, taskId);
 
-    // Sync .scrum.json
-    const repoPath = GitService.getProjectRepoPath(task.projectId);
-    ScrumFileService.syncProjectScrumFile(task.projectId, repoPath);
-
+    WorkflowService.recordScrumChange(task.projectId, `start task #${taskId} (lock ${task.scopePaths.join(', ')})`);
     return { lock };
   }
 
@@ -193,20 +245,18 @@ export class WorkflowService {
       throw new Error('access denied');
     }
 
-    const repoPath = GitService.getProjectRepoPath(projectId);
-    const gitService = new GitService(repoPath, project.defaultBranch);
-
+    const gitService = GitService.forProject(project);
     const snapshot = gitService.fetch(scope);
     ActivityLog.record(devId, ActionType.PULL, projectId);
+    ChangeFeed.bump();
 
     return { snapshot };
   }
 
   /**
    * Commit Done action:
-   * Developer works locally in their own IDE/terminal.
-   * When they click "Commit Done", SprintVault reads the Git commit from the project repository,
-   * verifies lock ownership, links the SHA, marks task COMPLETED, releases lock, and syncs .scrum.json!
+   * The developer committed (and, for remote projects, pushed) from their own machine.
+   * SprintVault syncs from origin, verifies the commit belongs to this task's work and completes the task.
    */
   static commitDone(
     taskId: number,
@@ -214,72 +264,92 @@ export class WorkflowService {
     commitSha?: string,
     pendingMessage?: string
   ): { sha: string; status: TaskStatus; message: string } {
+    const reject = (reason: string) => ({ type: 'rejectPush', reason });
+
     const task = Task.findById(taskId);
     if (!task) {
-      throw { type: 'rejectPush', reason: 'Task not found' };
+      throw reject('Task not found');
     }
 
     const isOwner = LockManager.verifyOwner(taskId, devId);
     if (!isOwner) {
-      throw { type: 'rejectPush', reason: 'Pusher does not own an active lock for this task' };
+      throw reject('Pusher does not own an active lock for this task');
     }
 
     if (task.status !== TaskStatus.IN_PROGRESS) {
-      throw { type: 'rejectPush', reason: 'Task is not currently IN_PROGRESS' };
+      throw reject('Task is not currently IN_PROGRESS');
     }
 
     const project = Project.findById(task.projectId);
     if (!project) {
-      throw { type: 'rejectPush', reason: 'Associated project not found' };
+      throw reject('Associated project not found');
     }
 
     const dev = User.findById(devId);
     if (!dev) {
-      throw { type: 'rejectPush', reason: 'Developer identity not found' };
+      throw reject('Developer identity not found');
     }
 
-    const repoPath = GitService.getProjectRepoPath(project.projectId);
+    const git = GitService.forProject(project);
+    try {
+      git.sync();
+    } catch (err: any) {
+      throw reject(`Could not sync with remote: ${err.message}`);
+    }
 
-    let finalSha = commitSha?.trim();
+    let finalSha: string | null | undefined = typeof commitSha === 'string' ? commitSha.trim() : undefined;
 
-    // If developer wants to commit pending local changes from disk
-    if (pendingMessage && pendingMessage.trim()) {
+    // Developer asks SprintVault to commit their pending on-disk changes (task scope only)
+    if (typeof pendingMessage === 'string' && pendingMessage.trim()) {
       try {
-        finalSha = GitHost.commitPendingChanges(
-          repoPath,
-          { name: dev.name, email: dev.email },
-          pendingMessage.trim()
-        );
+        finalSha = git.commitScopeChanges(task.scopePaths, { name: dev.name, email: dev.email }, pendingMessage.trim());
       } catch (err: any) {
-        throw { type: 'rejectPush', reason: `Git commit failed: ${err.message}` };
+        throw reject(`Git commit failed: ${err.message}`);
       }
     }
 
-    // If no SHA provided or produced, read latest commit from HEAD
     if (!finalSha) {
-      const latest = GitHost.getLatestCommit(repoPath);
+      const latest = git.latestCommit();
       if (!latest) {
-        throw { type: 'rejectPush', reason: 'No Git commits found in project repository' };
+        throw reject('No Git commits found in project repository');
       }
       finalSha = latest.sha;
     }
 
-    // 1. Task.complete(sha) - status = COMPLETED, commitSha, completedAt
-    task.complete(finalSha);
+    const resolved = git.resolveCommit(finalSha);
+    if (!resolved) {
+      throw reject(`Commit '${finalSha}' does not exist in this project's repository`);
+    }
+    if (git.isServiceCommit(resolved)) {
+      throw reject(`Commit ${resolved.substring(0, 7)} is a SprintVault bookkeeping commit, not your work`);
+    }
+    if (!git.isOnDefaultBranch(resolved)) {
+      throw reject(`Commit ${resolved.substring(0, 7)} is not on branch '${project.defaultBranch}'${git.hasRemote() ? ' — push it to origin first' : ''}`);
+    }
 
-    // 2. LockManager.release(taskId) - lock = RELEASED
+    const alreadyLinked = db.prepare(`
+      SELECT task_id FROM tasks WHERE project_id = ? AND commit_sha = ? AND task_id != ?
+    `).get(project.projectId, resolved, taskId) as { task_id: number } | undefined;
+    if (alreadyLinked) {
+      throw reject(`Commit ${resolved.substring(0, 7)} is already linked to Task #${alreadyLinked.task_id}`);
+    }
+
+    const lock = FileLock.findActiveByTaskId(taskId)!;
+    const lockStartedAt = Math.floor(new Date(lock.acquiredAt).getTime() / 1000);
+    if (git.commitTime(resolved) < lockStartedAt) {
+      throw reject(`Commit ${resolved.substring(0, 7)} was made before work on this task started (${lock.acquiredAt})`);
+    }
+
+    task.complete(resolved);
     LockManager.release(taskId);
+    ActivityLog.record(devId, ActionType.PUSH, resolved);
 
-    // 3. ActivityLog.record(PUSH, sha) - pushCount += 1, tasksCompleted += 1
-    ActivityLog.record(devId, ActionType.PUSH, finalSha);
-
-    // 4. Sync .scrum.json in project root
-    ScrumFileService.syncProjectScrumFile(project.projectId, repoPath);
+    WorkflowService.recordScrumChange(project.projectId, `complete task #${taskId} via ${resolved.substring(0, 7)}`);
 
     return {
-      sha: finalSha,
+      sha: resolved,
       status: TaskStatus.COMPLETED,
-      message: `Task #${taskId} completed and linked to Git commit ${finalSha.substring(0, 7)}`,
+      message: `Task #${taskId} completed and linked to Git commit ${resolved.substring(0, 7)}`,
     };
   }
 
@@ -316,12 +386,12 @@ export class WorkflowService {
       throw { type: 'rejectPush', reason: 'Developer identity not found' };
     }
 
-    const repoPath = GitService.getProjectRepoPath(project.projectId);
-    const gitService = new GitService(repoPath, project.defaultBranch);
+    const cleanFiles = validatePushFiles(files);
+    const cleanMsg = requireText(msg, 'Commit message', 5000);
 
     let sha: string;
     try {
-      sha = gitService.commitAndPush(files, msg, {
+      sha = GitService.forProject(project).commitAndPush(cleanFiles, cleanMsg, {
         name: dev.name,
         email: dev.email,
       });
@@ -333,8 +403,7 @@ export class WorkflowService {
     LockManager.release(taskId);
     ActivityLog.record(devId, ActionType.PUSH, sha);
 
-    // Sync .scrum.json
-    ScrumFileService.syncProjectScrumFile(project.projectId, repoPath);
+    WorkflowService.recordScrumChange(project.projectId, `complete task #${taskId} via ${sha.substring(0, 7)}`);
 
     return { sha, status: TaskStatus.COMPLETED };
   }
@@ -343,10 +412,7 @@ export class WorkflowService {
    * Flow 4.4: Force-release (UC-13, Manager only)
    */
   static forceRelease(taskId: number, managerId: number): void {
-    const user = User.findById(managerId);
-    if (!user || user.role !== UserRole.MANAGER) {
-      throw new Error('access denied');
-    }
+    WorkflowService.requireManager(managerId);
 
     const task = Task.findById(taskId);
     if (!task) {
@@ -361,9 +427,7 @@ export class WorkflowService {
     task.reset();
     ActivityLog.record(managerId, ActionType.FORCE_UNLOCK, taskId);
 
-    // Sync .scrum.json
-    const repoPath = GitService.getProjectRepoPath(task.projectId);
-    ScrumFileService.syncProjectScrumFile(task.projectId, repoPath);
+    WorkflowService.recordScrumChange(task.projectId, `force-release task #${taskId}`);
   }
 
   /**
@@ -378,8 +442,7 @@ export class WorkflowService {
       throw new Error('Project not found');
     }
 
-    const repoPath = GitService.getProjectRepoPath(projectId);
-    const { nodes, rawGraphText } = GitHost.getCommitGraph(repoPath, 60);
+    const { nodes, rawGraphText } = GitService.forProject(project).commitGraph(60);
 
     // Fetch all completed tasks with commit_sha for this project
     const tasksWithSha = db.prepare(`
@@ -424,8 +487,7 @@ export class WorkflowService {
       throw new Error('Project not found');
     }
 
-    const repoPath = GitService.getProjectRepoPath(projectId);
-    return GitHost.getGitMetadata(repoPath);
+    return GitService.forProject(project).metadata();
   }
 
   /**
@@ -437,70 +499,42 @@ export class WorkflowService {
       throw new Error('access denied');
     }
 
-    if (user.role === UserRole.MANAGER) {
-      const tasks = db.prepare(`
-        SELECT t.*, p.name as project_name, u.name as assignee_name, u.email as assignee_email
-        FROM tasks t
-        JOIN projects p ON t.project_id = p.project_id
-        LEFT JOIN users u ON t.assignee_id = u.user_id
-        ORDER BY t.task_id DESC
-      `).all() as unknown as any[];
+    const isManager = user.role === UserRole.MANAGER;
+    const tasks = db.prepare(`
+      SELECT t.*, p.name as project_name, u.name as assignee_name, u.email as assignee_email
+      FROM tasks t
+      JOIN projects p ON t.project_id = p.project_id
+      LEFT JOIN users u ON t.assignee_id = u.user_id
+      ${isManager ? '' : 'WHERE t.assignee_id = ?'}
+      ORDER BY t.task_id DESC
+    `).all(...(isManager ? [] : [userId])) as unknown as any[];
 
-      const developerStats = db.prepare(`
-        SELECT s.*, u.name, u.email
-        FROM developer_stats s
-        JOIN users u ON s.user_id = u.user_id
-        ORDER BY s.tasks_completed DESC, s.push_count DESC
-      `).all() as unknown as any[];
+    // Same row shape for both roles (snake_case, as the client expects)
+    const developerStats = db.prepare(`
+      SELECT s.*, u.name, u.email
+      FROM developer_stats s
+      JOIN users u ON s.user_id = u.user_id
+      ${isManager ? '' : 'WHERE s.user_id = ?'}
+      ORDER BY s.tasks_completed DESC, s.push_count DESC
+    `).all(...(isManager ? [] : [userId])) as unknown as any[];
 
-      const activeLocks = db.prepare(`
-        SELECT l.*, t.title as task_title, u.name as owner_name
-        FROM file_locks l
-        JOIN tasks t ON l.task_id = t.task_id
-        JOIN users u ON l.owner_id = u.user_id
-        WHERE l.status = 'ACTIVE'
-      `).all() as unknown as any[];
+    const activeLocks = db.prepare(`
+      SELECT l.*, t.title as task_title, t.project_id, u.name as owner_name
+      FROM file_locks l
+      JOIN tasks t ON l.task_id = t.task_id
+      JOIN users u ON l.owner_id = u.user_id
+      WHERE l.status = 'ACTIVE' ${isManager ? '' : 'AND l.owner_id = ?'}
+    `).all(...(isManager ? [] : [userId])) as unknown as any[];
 
-      const recentActivity = ActivityLog.findAll(30);
+    const recentActivity = isManager ? ActivityLog.findAll(30) : ActivityLog.findByUserId(userId, 30);
 
-      return {
-        role: UserRole.MANAGER,
-        user: { userId: user.userId, name: user.name, email: user.email, role: user.role },
-        tasks,
-        developerStats,
-        activeLocks,
-        recentActivity,
-      };
-    } else {
-      const tasks = db.prepare(`
-        SELECT t.*, p.name as project_name, u.name as assignee_name, u.email as assignee_email
-        FROM tasks t
-        JOIN projects p ON t.project_id = p.project_id
-        LEFT JOIN users u ON t.assignee_id = u.user_id
-        WHERE t.assignee_id = ?
-        ORDER BY t.task_id DESC
-      `).all(userId) as unknown as any[];
-
-      const stats = DeveloperStats.findByUserId(userId);
-
-      const activeLocks = db.prepare(`
-        SELECT l.*, t.title as task_title, u.name as owner_name
-        FROM file_locks l
-        JOIN tasks t ON l.task_id = t.task_id
-        JOIN users u ON l.owner_id = u.user_id
-        WHERE l.owner_id = ? AND l.status = 'ACTIVE'
-      `).all(userId) as unknown as any[];
-
-      const recentActivity = ActivityLog.findByUserId(userId, 30);
-
-      return {
-        role: UserRole.DEVELOPER,
-        user: { userId: user.userId, name: user.name, email: user.email, role: user.role },
-        tasks,
-        developerStats: stats ? [{ ...stats, name: user.name, email: user.email }] : [],
-        activeLocks,
-        recentActivity,
-      };
-    }
+    return {
+      role: user.role,
+      user: { userId: user.userId, name: user.name, email: user.email, role: user.role },
+      tasks,
+      developerStats,
+      activeLocks,
+      recentActivity,
+    };
   }
 }

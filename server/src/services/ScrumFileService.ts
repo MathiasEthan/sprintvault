@@ -3,7 +3,7 @@ import path from 'path';
 import { db } from '../db/database';
 import { Project } from '../models/Project';
 import { Task } from '../models/Task';
-import { FileLock } from '../models/FileLock';
+import { ActivityLog } from '../models/ActivityLog';
 import { TaskRow, FileLockRow, ActivityLogRow, LockStatus } from '../types';
 
 export interface ScrumFileData {
@@ -122,13 +122,13 @@ export class ScrumFileService {
         };
       });
 
-      const activityRows = db.prepare(`
-        SELECT a.log_id as logId, u.name as userName, a.action, a.ref, a.created_at as createdAt
-        FROM activity_log a
-        JOIN users u ON a.user_id = u.user_id
-        ORDER BY a.log_id DESC
-        LIMIT 30
-      `).all() as unknown as Array<{ logId: number; userName: string; action: string; ref: string; createdAt: string }>;
+      const activityRows = ActivityLog.findByProjectId(projectId, 30).map((a) => ({
+        logId: a.log_id,
+        userName: a.user_name,
+        action: a.action,
+        ref: a.ref,
+        createdAt: a.created_at,
+      }));
 
       const scrumData: ScrumFileData = {
         schemaVersion: '1.0',

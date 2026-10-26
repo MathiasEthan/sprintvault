@@ -34,3 +34,6 @@ yarn-error.log*
 # OS files
 .DS_Store
 Thumbs.db
+
+# Generated login-token secret
+.sprintvault-jwt-secret

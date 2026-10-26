@@ -92,6 +92,7 @@ export interface ActivityLogItem {
   action: ActionType;
   ref: string;
   created_at: string;
+  project_id?: number | null;
 }
 
 export interface GitFileItem {

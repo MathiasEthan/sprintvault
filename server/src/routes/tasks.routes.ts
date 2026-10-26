@@ -3,15 +3,20 @@ import { authenticate, AuthenticatedRequest, requireManager, requireDeveloper } 
 import { WorkflowService } from '../services/WorkflowService';
 import { Task } from '../models/Task';
 import { FileLock } from '../models/FileLock';
+import { Project } from '../models/Project';
 import { db } from '../db/database';
+import { UserRole } from '../types';
+import { requireId, validatePushFiles, requireText, ValidationError } from '../validation';
+import { sendError } from './errors';
 
 const router = Router();
 
 /**
- * GET /api/tasks - List tasks
+ * GET /api/tasks - List tasks (developers only see projects they are a member of)
  */
 router.get('/', authenticate, (req: AuthenticatedRequest, res: Response) => {
   const { projectId } = req.query;
+  const isManager = req.user!.role === UserRole.MANAGER;
 
   let query = `
     SELECT t.*, p.name as project_name, u.name as assignee_name, u.email as assignee_email,
@@ -21,12 +26,30 @@ router.get('/', authenticate, (req: AuthenticatedRequest, res: Response) => {
     LEFT JOIN users u ON t.assignee_id = u.user_id
     LEFT JOIN file_locks fl ON t.task_id = fl.task_id AND fl.status = 'ACTIVE'
     LEFT JOIN users lu ON fl.owner_id = lu.user_id
+    WHERE 1 = 1
   `;
 
   const params: any[] = [];
-  if (projectId) {
-    query += ' WHERE t.project_id = ?';
-    params.push(projectId);
+  if (projectId !== undefined) {
+    let id: number;
+    try {
+      id = requireId(projectId, 'projectId');
+    } catch (err) {
+      return sendError(res, err);
+    }
+    const project = Project.findById(id);
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+    if (!isManager && !project.isMember(req.user!.userId)) {
+      return res.status(403).json({ error: 'access denied' });
+    }
+    query += ' AND t.project_id = ?';
+    params.push(id);
+  }
+  if (!isManager) {
+    query += ' AND t.project_id IN (SELECT project_id FROM project_members WHERE user_id = ?)';
+    params.push(req.user!.userId);
   }
 
   query += ' ORDER BY t.task_id DESC';
@@ -54,38 +77,31 @@ router.get('/', authenticate, (req: AuthenticatedRequest, res: Response) => {
  * GET /api/tasks/:id - Single task
  */
 router.get('/:id', authenticate, (req: AuthenticatedRequest, res: Response) => {
-  const taskId = parseInt(req.params.id, 10);
-  const task = Task.findById(taskId);
-  if (!task) {
-    return res.status(404).json({ error: 'Task not found' });
-  }
+  try {
+    const taskId = requireId(req.params.id, 'Task id');
+    const task = Task.findById(taskId);
+    if (!task) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    WorkflowService.assertCanView(Project.findById(task.projectId)!, req.user!.userId);
 
-  const activeLock = FileLock.findActiveByTaskId(taskId);
-  return res.json({ task, activeLock });
+    const activeLock = FileLock.findActiveByTaskId(taskId);
+    return res.json({ task, activeLock });
+  } catch (err) {
+    return sendError(res, err);
+  }
 });
 
 /**
  * POST /api/tasks - Create task (Manager only)
  */
 router.post('/', authenticate, requireManager, (req: AuthenticatedRequest, res: Response) => {
-  const { projectId, title, scopePaths } = req.body;
-  if (!projectId || !title) {
-    return res.status(400).json({ error: 'projectId and title are required' });
-  }
-
+  const { projectId, title, scopePaths } = req.body ?? {};
   try {
-    const task = WorkflowService.createTask(
-      projectId,
-      title,
-      Array.isArray(scopePaths) ? scopePaths : (scopePaths ? [scopePaths] : ['/']),
-      req.user!.userId
-    );
+    const task = WorkflowService.createTask(requireId(projectId, 'projectId'), title, scopePaths, req.user!.userId);
     return res.status(201).json({ task });
-  } catch (err: any) {
-    if (err.message === 'access denied') {
-      return res.status(403).json({ error: 'access denied' });
-    }
-    return res.status(400).json({ error: err.message });
+  } catch (err) {
+    return sendError(res, err);
   }
 });
 
@@ -93,20 +109,13 @@ router.post('/', authenticate, requireManager, (req: AuthenticatedRequest, res: 
  * POST /api/tasks/:id/assign - Assign task (Manager only)
  */
 router.post('/:id/assign', authenticate, requireManager, (req: AuthenticatedRequest, res: Response) => {
-  const taskId = parseInt(req.params.id, 10);
-  const { devId } = req.body;
-  if (!devId) {
-    return res.status(400).json({ error: 'devId is required' });
-  }
-
   try {
+    const taskId = requireId(req.params.id, 'Task id');
+    const devId = requireId(req.body?.devId, 'devId');
     const task = WorkflowService.assignTask(taskId, devId, req.user!.userId);
     return res.json({ task });
-  } catch (err: any) {
-    if (err.message === 'access denied') {
-      return res.status(403).json({ error: 'access denied' });
-    }
-    return res.status(400).json({ error: err.message });
+  } catch (err) {
+    return sendError(res, err);
   }
 });
 
@@ -114,54 +123,42 @@ router.post('/:id/assign', authenticate, requireManager, (req: AuthenticatedRequ
  * POST /api/tasks/:id/start - Start work (Developer only)
  */
 router.post('/:id/start', authenticate, requireDeveloper, (req: AuthenticatedRequest, res: Response) => {
-  const taskId = parseInt(req.params.id, 10);
-
   try {
+    const taskId = requireId(req.params.id, 'Task id');
     const result = WorkflowService.startWork(taskId, req.user!.userId);
     return res.json({
       message: 'lockGranted',
       lock: result.lock,
     });
-  } catch (err: any) {
-    if (err.type === 'rejectStart') {
-      return res.status(409).json({
-        error: 'rejectStart',
-        reason: err.reason,
-      });
-    }
-    return res.status(400).json({ error: err.message || 'Failed to start work' });
+  } catch (err) {
+    return sendError(res, err);
   }
 });
 
 /**
- * POST /api/tasks/:id/commit-done - Developer completed commit in their local IDE / terminal!
- * Inspects Git commit from repo, links SHA to task, releases lock, completes task.
+ * POST /api/tasks/:id/commit-done - Developer committed (and pushed) from their own machine.
+ * Syncs from origin, verifies the commit, links SHA to task, releases lock, completes task.
  */
 router.post('/:id/commit-done', authenticate, requireDeveloper, (req: AuthenticatedRequest, res: Response) => {
-  const taskId = parseInt(req.params.id, 10);
-  const { commitSha, pendingMessage } = req.body;
+  const { commitSha, pendingMessage } = req.body ?? {};
 
   try {
-    const result = WorkflowService.commitDone(
-      taskId,
-      req.user!.userId,
-      commitSha,
-      pendingMessage
-    );
+    const taskId = requireId(req.params.id, 'Task id');
+    if (commitSha !== undefined && commitSha !== null && typeof commitSha !== 'string') {
+      throw new ValidationError('commitSha must be a string');
+    }
+    if (pendingMessage !== undefined && pendingMessage !== null && typeof pendingMessage !== 'string') {
+      throw new ValidationError('pendingMessage must be a string');
+    }
+    const result = WorkflowService.commitDone(taskId, req.user!.userId, commitSha ?? undefined, pendingMessage ?? undefined);
     return res.json({
       message: 'commitDoneReceipt',
       sha: result.sha,
       status: result.status,
       detail: result.message,
     });
-  } catch (err: any) {
-    if (err.type === 'rejectPush') {
-      return res.status(403).json({
-        error: 'rejectPush',
-        reason: err.reason,
-      });
-    }
-    return res.status(400).json({ error: err.message || 'Commit Done failed' });
+  } catch (err) {
+    return sendError(res, err);
   }
 });
 
@@ -169,32 +166,28 @@ router.post('/:id/commit-done', authenticate, requireDeveloper, (req: Authentica
  * POST /api/tasks/:id/push - Push work (Developer only)
  */
 router.post('/:id/push', authenticate, requireDeveloper, (req: AuthenticatedRequest, res: Response) => {
-  const taskId = parseInt(req.params.id, 10);
-  const { files, msg } = req.body;
+  const { files, msg } = req.body ?? {};
 
-  if (!files || !Array.isArray(files) || files.length === 0) {
-    return res.status(400).json({ error: 'rejectPush', reason: 'No files provided for commit' });
-  }
-
-  if (!msg || !msg.trim()) {
-    return res.status(400).json({ error: 'rejectPush', reason: 'Commit message is required' });
+  let cleanFiles: { path: string; content: string }[];
+  let cleanMsg: string;
+  let taskId: number;
+  try {
+    taskId = requireId(req.params.id, 'Task id');
+    cleanFiles = validatePushFiles(files);
+    cleanMsg = requireText(msg, 'Commit message', 5000);
+  } catch (err: any) {
+    return res.status(400).json({ error: 'rejectPush', reason: err.message });
   }
 
   try {
-    const result = WorkflowService.pushWork(taskId, req.user!.userId, files, msg.trim());
+    const result = WorkflowService.pushWork(taskId, req.user!.userId, cleanFiles, cleanMsg);
     return res.json({
       message: 'pushReceipt',
       sha: result.sha,
       status: result.status,
     });
-  } catch (err: any) {
-    if (err.type === 'rejectPush') {
-      return res.status(403).json({
-        error: 'rejectPush',
-        reason: err.reason,
-      });
-    }
-    return res.status(400).json({ error: err.message || 'Push failed' });
+  } catch (err) {
+    return sendError(res, err);
   }
 });
 
@@ -202,16 +195,11 @@ router.post('/:id/push', authenticate, requireDeveloper, (req: AuthenticatedRequ
  * POST /api/tasks/:id/force-release - Force release lock (Manager only)
  */
 router.post('/:id/force-release', authenticate, requireManager, (req: AuthenticatedRequest, res: Response) => {
-  const taskId = parseInt(req.params.id, 10);
-
   try {
-    WorkflowService.forceRelease(taskId, req.user!.userId);
+    WorkflowService.forceRelease(requireId(req.params.id, 'Task id'), req.user!.userId);
     return res.json({ success: true, message: 'Lock force-released and task reset to ASSIGNED' });
-  } catch (err: any) {
-    if (err.message === 'access denied') {
-      return res.status(403).json({ error: 'access denied' });
-    }
-    return res.status(400).json({ error: err.message });
+  } catch (err) {
+    return sendError(res, err);
   }
 });
 

@@ -1,6 +1,7 @@
 import assert from 'assert';
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'child_process';
 
 async function runTests() {
   console.log('🧪 Starting SprintVault Comprehensive Test Suite (Scrum + Git Commit Graph + .scrum.json)...\n');
@@ -212,7 +213,140 @@ async function runTests() {
   assert.strictEqual(task2Reset?.status, TaskStatus.ASSIGNED);
   console.log('  ✔ Task 2 acquired lock and was force-released back to ASSIGNED');
 
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+  const expectReject = (fn: () => unknown, type: string, pattern: RegExp) => {
+    try {
+      fn();
+    } catch (err: any) {
+      assert.strictEqual(err.type, type, `expected ${type}, got ${err.type || err.message}`);
+      assert.match(err.reason, pattern);
+      return;
+    }
+    assert.fail(`expected ${type} matching ${pattern}`);
+  };
+
+  // Test 12: State-machine guards (LOGIC §2)
+  console.log('▶ Test 12: assignTask only from CREATED / ASSIGNED');
+  WorkflowService.startWork(task2.taskId, dev2Id);
+  assert.throws(() => WorkflowService.assignTask(task2.taskId, dev1Id, leadId), /cannot be assigned from status 'IN_PROGRESS'/);
+  assert.ok(FileLock.findActiveByTaskId(task2.taskId), 'Lock must stay with the IN_PROGRESS task');
+  assert.throws(() => WorkflowService.assignTask(task1.taskId, dev2Id, leadId), /cannot be assigned from status 'COMPLETED'/);
+  WorkflowService.forceRelease(task2.taskId, leadId);
+  console.log('  ✔ IN_PROGRESS and COMPLETED tasks cannot be reassigned');
+
+  // Test 13: Locks are per project and paths are normalized
+  console.log('▶ Test 13: Per-project locks and path normalization');
+  const otherProject = WorkflowService.createProject('Other Service', 'git://local/other.git', 'main', leadId, [dev1Id, dev2Id]);
+  const lockA = WorkflowService.createTask(project.projectId, 'Lib A', ['lib/core/'], leadId);
+  const lockB = WorkflowService.createTask(otherProject.projectId, 'Lib B', ['lib/core/'], leadId);
+  const lockC = WorkflowService.createTask(project.projectId, 'Lib C', ['.\\lib\\core\\x.ts'], leadId);
+  assert.deepStrictEqual(lockC.scopePaths, ['lib/core/x.ts'], 'Scope paths are normalized on creation');
+  WorkflowService.assignTask(lockA.taskId, dev1Id, leadId);
+  WorkflowService.assignTask(lockB.taskId, dev2Id, leadId);
+  WorkflowService.assignTask(lockC.taskId, dev2Id, leadId);
+  WorkflowService.startWork(lockA.taskId, dev1Id);
+  WorkflowService.startWork(lockB.taskId, dev2Id); // same path, different project: allowed
+  expectReject(() => WorkflowService.startWork(lockC.taskId, dev2Id), 'rejectStart', /overlaps/);
+  assert.throws(() => WorkflowService.createTask(project.projectId, 'Bad', ['../etc'], leadId), /must not contain '\.\.'/);
+  assert.throws(() => WorkflowService.createTask(project.projectId, '   ', ['a/'], leadId), /Title is required/);
+  assert.throws(() => WorkflowService.createTask(project.projectId, 'Empty', [], leadId), /non-empty array/);
+  console.log('  ✔ Same scope in another project allowed; ./ and \\ variants detected; bad input rejected');
+
+  // Test 14: Push safety, no-op pushes, .scrum.json stays out of developer commits
+  console.log('▶ Test 14: Push path safety and Scrum auto-commits');
+  assert.throws(() => WorkflowService.pushWork(lockA.taskId, dev1Id, [{ path: '../escape.txt', content: 'x' }], 'x'), /'\.\.'/);
+  assert.throws(() => WorkflowService.pushWork(lockA.taskId, dev1Id, [{ path: '.git/config', content: 'x' }], 'x'), /inside \.git/);
+  expectReject(
+    () => WorkflowService.pushWork(lockA.taskId, dev1Id, [{ path: 'README.md', content: fs.readFileSync(path.join(repoPath, 'README.md'), 'utf8') }], 'noop'),
+    'rejectPush',
+    /No changes to commit/
+  );
+  const pushRes = WorkflowService.pushWork(lockA.taskId, dev1Id, [{ path: 'lib/core/index.ts', content: 'export {};\n' }], 'feat: core\n\nmulti-line body | with pipe');
+  const pushedFiles = git(repoPath, 'show', '--name-only', '--format=', pushRes.sha);
+  assert.strictEqual(pushedFiles, 'lib/core/index.ts', 'Developer commit contains only the pushed file');
+  assert.strictEqual(git(repoPath, 'log', '-1', '--format=%B', pushRes.sha), 'feat: core\n\nmulti-line body | with pipe');
+  assert.match(git(repoPath, 'log', '-1', '--format=%s'), /^chore\(scrum\): complete task #\d+/, 'Scrum change committed after the push');
+  assert.strictEqual(git(repoPath, 'status', '--porcelain'), '', 'Working tree clean after every Scrum change');
+  console.log('  ✔ Unsafe paths and no-op pushes rejected; every Scrum change is a service-account commit');
+
+  // Test 15: Commit Done validates the commit
+  console.log('▶ Test 15: Commit Done verification');
+  const cdTask = WorkflowService.createTask(project.projectId, 'Docs', ['docs/'], leadId);
+  WorkflowService.assignTask(cdTask.taskId, dev1Id, leadId);
+  // A developer commit made (and backdated) before the task was started
+  fs.writeFileSync(path.join(repoPath, 'OLD_NOTES.md'), 'old\n');
+  git(repoPath, 'add', 'OLD_NOTES.md');
+  execFileSync('git', ['commit', '-q', '-m', 'old work', '--author=Alex <alex@sprintvault.com>', '--date=2020-01-01T00:00:00'], {
+    cwd: repoPath,
+    env: { ...process.env, GIT_COMMITTER_DATE: '2020-01-01T00:00:00' },
+  });
+  const oldSha = git(repoPath, 'rev-parse', 'HEAD');
+  WorkflowService.startWork(cdTask.taskId, dev1Id);
+  expectReject(() => WorkflowService.commitDone(cdTask.taskId, dev1Id, 'deadbeef'), 'rejectPush', /does not exist/);
+  expectReject(() => WorkflowService.commitDone(cdTask.taskId, dev1Id, pushRes.sha), 'rejectPush', /already linked to Task/);
+  expectReject(() => WorkflowService.commitDone(cdTask.taskId, dev1Id), 'rejectPush', /bookkeeping commit/);
+  expectReject(() => WorkflowService.commitDone(cdTask.taskId, dev1Id, oldSha), 'rejectPush', /before work on this task started/);
+  fs.mkdirSync(path.join(repoPath, 'docs'), { recursive: true });
+  fs.writeFileSync(path.join(repoPath, 'docs', 'guide.md'), '# Guide\n');
+  fs.writeFileSync(path.join(repoPath, 'SOMEONE_ELSES_WIP.txt'), 'not mine');
+  const cdRes = WorkflowService.commitDone(cdTask.taskId, dev1Id, undefined, 'docs: guide');
+  assert.strictEqual(git(repoPath, 'show', '--name-only', '--format=', cdRes.sha), 'docs/guide.md', 'Pending mode commits task scope only');
+  fs.unlinkSync(path.join(repoPath, 'SOMEONE_ELSES_WIP.txt'));
+  console.log('  ✔ Fake, foreign-task and pre-lock commits rejected; pending mode stays in scope');
+
+  // Test 16: Scrum changes reach every machine through the remote (T-41)
+  console.log('▶ Test 16: Two-machine sync through origin');
+  const remotePath = path.join(testReposPath, 'remote', 'shared.git');
+  fs.mkdirSync(remotePath, { recursive: true });
+  git(remotePath, 'init', '--bare', '-b', 'main');
+  const shared = WorkflowService.createProject('Shared', remotePath, 'main', leadId, [dev1Id, dev2Id]);
+  const devMachine = path.join(testReposPath, 'dev-machine');
+  git(testReposPath, 'clone', '--quiet', remotePath, devMachine);
+  git(devMachine, 'config', 'user.name', 'Alex');
+  git(devMachine, 'config', 'user.email', 'alex@sprintvault.com');
+  const readScrum = () => JSON.parse(fs.readFileSync(path.join(devMachine, '.scrum.json'), 'utf8'));
+  assert.strictEqual(readScrum().projectName, 'Shared', 'Project creation published to origin');
+
+  const remoteTask = WorkflowService.createTask(shared.projectId, 'Remote feature', ['feature/'], leadId);
+  WorkflowService.assignTask(remoteTask.taskId, dev1Id, leadId);
+  WorkflowService.startWork(remoteTask.taskId, dev1Id);
+  git(devMachine, 'pull', '--quiet');
+  assert.strictEqual(readScrum().tasks[0].status, 'IN_PROGRESS', 'Developer machine sees the Scrum change after git pull');
+  assert.match(git(devMachine, 'log', '-1', '--format=%s'), /^chore\(scrum\): start task/);
+
+  fs.mkdirSync(path.join(devMachine, 'feature'), { recursive: true });
+  fs.writeFileSync(path.join(devMachine, 'feature', 'work.ts'), 'export const done = true;\n');
+  git(devMachine, 'add', 'feature/work.ts');
+  git(devMachine, 'commit', '--quiet', '-m', 'feat: remote work');
+  const devSha = git(devMachine, 'rev-parse', 'HEAD');
+  git(devMachine, 'push', '--quiet', 'origin', 'main');
+  const remoteDone = WorkflowService.commitDone(remoteTask.taskId, dev1Id, devSha);
+  assert.strictEqual(remoteDone.sha, devSha, 'Commit pushed from the developer machine is linked');
+  git(devMachine, 'pull', '--quiet');
+  assert.strictEqual(readScrum().tasks[0].status, 'COMPLETED');
+  assert.strictEqual(readScrum().tasks[0].commitSha, devSha);
+  console.log('  ✔ Every Scrum change is committed and pushed; developer commits are synced back');
+
+  // Test 17: Developer dashboard row shape, import-local and atomic project creation
+  console.log('▶ Test 17: Dashboard shape, import-local, atomic create');
+  const devDash = WorkflowService.getDashboard(dev1Id);
+  assert.ok('push_count' in devDash.developerStats[0], 'Developer stats use the same snake_case shape as the manager view');
+  const importDir = path.join(testReposPath, 'existing-app');
+  fs.mkdirSync(path.join(importDir, 'lib'), { recursive: true });
+  fs.writeFileSync(path.join(importDir, 'README.md'), 'ORIGINAL');
+  fs.writeFileSync(path.join(importDir, 'lib', 'mine.js'), 'module.exports = 1;\n');
+  const imported = WorkflowService.createProject('Existing', `file://${importDir}`, 'main', leadId, [dev1Id], importDir);
+  assert.strictEqual(fs.readFileSync(path.join(importDir, 'README.md'), 'utf8'), 'ORIGINAL', 'Import never overwrites files');
+  const importedFiles = WorkflowService.browseFiles(imported.projectId).map((f) => f.path).sort();
+  assert.deepStrictEqual(importedFiles, ['README.md', 'lib/mine.js'], 'Imported project browses its own directory');
+  const projectCount = Project.findAll().length;
+  assert.throws(() => WorkflowService.createProject('Broken', 'git://local/x.git', 'bad branch..', leadId, []), /not a valid branch name/);
+  assert.strictEqual(Project.findAll().length, projectCount, 'Failed creation leaves no project row');
+  console.log('  ✔ Dashboard shape consistent; import is non-destructive; failed creation rolls back');
+
   // Clean up test DB & test repos
+  db.close();
   if (fs.existsSync(testDbPath)) fs.unlinkSync(testDbPath);
   if (fs.existsSync(`${testDbPath}-wal`)) fs.unlinkSync(`${testDbPath}-wal`);
   if (fs.existsSync(`${testDbPath}-shm`)) fs.unlinkSync(`${testDbPath}-shm`);

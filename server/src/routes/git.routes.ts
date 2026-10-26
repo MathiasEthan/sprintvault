@@ -1,28 +1,31 @@
 import { Router, Response } from 'express';
 import { authenticate, AuthenticatedRequest, requireDeveloper } from '../middleware/auth';
 import { WorkflowService } from '../services/WorkflowService';
+import { requireId, ValidationError } from '../validation';
+import { sendError } from './errors';
 
 const router = Router();
+
+function parseScope(scope: unknown): string[] {
+  if (scope === undefined || scope === null || scope === '') return [];
+  const list = Array.isArray(scope) ? scope : [scope];
+  if (!list.every((s) => typeof s === 'string')) {
+    throw new ValidationError('scope must be a string or list of strings');
+  }
+  return (list as string[]).map((s) => s.trim()).filter(Boolean);
+}
 
 /**
  * GET /api/git/browse/:projectId - Browse repository files (Read-only, no stats change)
  */
 router.get('/browse/:projectId', authenticate, (req: AuthenticatedRequest, res: Response) => {
-  const projectId = parseInt(req.params.projectId, 10);
-  const { branch, scope } = req.query;
-
   try {
-    let scopeList: string[] = [];
-    if (typeof scope === 'string') {
-      scopeList = [scope];
-    } else if (Array.isArray(scope)) {
-      scopeList = scope as string[];
-    }
-
-    const files = WorkflowService.browseFiles(projectId, branch as string, scopeList);
+    const projectId = requireId(req.params.projectId, 'projectId');
+    const branch = typeof req.query.branch === 'string' && req.query.branch ? req.query.branch : undefined;
+    const files = WorkflowService.browseFiles(projectId, branch, parseScope(req.query.scope), req.user!.userId);
     return res.json({ files });
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message });
+  } catch (err) {
+    return sendError(res, err);
   }
 });
 
@@ -31,29 +34,15 @@ router.get('/browse/:projectId', authenticate, (req: AuthenticatedRequest, res: 
  * Messages 8-12 in LOGIC.md
  */
 router.post('/pull', authenticate, requireDeveloper, (req: AuthenticatedRequest, res: Response) => {
-  const { projectId, scope } = req.body;
-  if (!projectId) {
-    return res.status(400).json({ error: 'projectId is required' });
-  }
-
   try {
-    let scopeList: string[] = [];
-    if (Array.isArray(scope)) {
-      scopeList = scope;
-    } else if (typeof scope === 'string' && scope.trim()) {
-      scopeList = [scope.trim()];
-    }
-
-    const result = WorkflowService.pullCode(projectId, scopeList, req.user!.userId);
+    const projectId = requireId(req.body?.projectId, 'projectId');
+    const result = WorkflowService.pullCode(projectId, parseScope(req.body?.scope), req.user!.userId);
     return res.json({
       message: 'sendSnapshot',
       snapshot: result.snapshot,
     });
-  } catch (err: any) {
-    if (err.message === 'access denied') {
-      return res.status(403).json({ error: 'access denied' });
-    }
-    return res.status(400).json({ error: err.message });
+  } catch (err) {
+    return sendError(res, err);
   }
 });
 

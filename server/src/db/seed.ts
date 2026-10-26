@@ -26,8 +26,6 @@ export function seedInitialProject() {
       devIds
     );
 
-    // 2. Add sample starter files to repository for rich code browsing & editing
-    const repoPath = WorkflowService['createProject'] ? null : null; // just syntax check
 
     // 3. Create initial tasks across states
     // Task 1: Assigned to Dev 1 (Alex Rivera)

@@ -52,7 +52,7 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
 
 export const api = {
   // Auth
-  login: async (email: string, password: string = 'password123') => {
+  login: async (email: string, password: string) => {
     return request<{ token: string; user: User }>('/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
@@ -63,6 +63,13 @@ export const api = {
   },
   getUsers: async () => {
     return request<{ users: Array<{ user_id: number; name: string; email: string; role: string }> }>('/auth/users');
+  },
+  // Public 1-click login list; empty unless the server runs with DEMO_MODE=true
+  getDemoUsers: async () => {
+    return request<{ enabled: boolean; users: Array<{ user_id: number; name: string; email: string; role: string }>; demoPassword?: string }>('/auth/demo-users');
+  },
+  getChanges: async () => {
+    return request<{ version: number }>('/changes');
   },
   logout: async () => {
     return request<{ success: boolean }>('/auth/logout', { method: 'POST' });
