@@ -60,6 +60,36 @@ export interface Task {
   lock_owner_id?: number;
   lock_owner_name?: string;
   lock_acquired_at?: string;
+  lock_last_activity_at?: string | null;
+  lock_is_stale?: boolean;
+}
+
+export type GovernanceKind = 'LOCK_CONFLICT' | 'SCOPE_VIOLATION' | 'FORCE_RELEASE' | 'STALE_RELEASE';
+
+export interface GovernanceEvent {
+  event_id: number;
+  kind: GovernanceKind;
+  user_id: number;
+  user_name: string;
+  project_id: number;
+  project_name: string;
+  task_id: number;
+  task_title: string;
+  detail: string;
+  created_at: string;
+}
+
+export interface GovernanceMetrics {
+  conflictsPrevented: number;
+  scopeViolationsBlocked: number;
+  staleLocksReleased: number;
+  forceReleases: number;
+  avgCycleHours: number | null;
+  completedThisWeek: number;
+  activeLocks: number;
+  staleLocks: number;
+  staleAfterHours: number;
+  recentEvents: GovernanceEvent[];
 }
 
 export interface DeveloperStats {

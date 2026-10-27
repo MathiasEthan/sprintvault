@@ -11,6 +11,7 @@ import { initDatabase } from './db/database';
 import { seedInitialProject } from './db/seed';
 import { authenticate } from './middleware/auth';
 import { ChangeFeed } from './services/ChangeFeed';
+import { LockManager } from './services/LockManager';
 
 // Initialize DB schema and seed 5 users + initial project
 initDatabase();
@@ -31,6 +32,7 @@ app.use('/api/dashboard', dashboardRoutes);
 
 // Change marker: clients poll this and refresh their views when it moves
 app.get('/api/changes', authenticate, (req: Request, res: Response) => {
+  LockManager.noticeStaleLocks();
   res.json({ version: ChangeFeed.current() });
 });
 

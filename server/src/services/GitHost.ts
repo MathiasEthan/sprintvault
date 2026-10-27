@@ -175,19 +175,60 @@ export class GitHost {
   }): string {
     const { repoPath, branch, files, msg, author } = commitData;
     this.checkoutBranch(repoPath, branch);
+    this.assertExactCase(repoPath, files.map((f) => f.path));
 
-    for (const item of files) {
+    // Remember what was on disk so a failed push leaves the working tree exactly as it was
+    const originals = files.map((item) => {
       const fullPath = path.join(repoPath, item.path);
-      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-      fs.writeFileSync(fullPath, item.content, 'utf8');
-    }
+      return { path: item.path, fullPath, content: fs.existsSync(fullPath) ? fs.readFileSync(fullPath) : null };
+    });
 
     const paths = files.map((f) => f.path);
-    this.run(repoPath, ['add', '--', ...paths]);
-    if (this.check(repoPath, ['diff', '--cached', '--quiet', '--', ...paths])) {
-      throw new Error('No changes to commit: pushed files are identical to the repository');
+    try {
+      for (const item of files) {
+        const fullPath = path.join(repoPath, item.path);
+        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+        fs.writeFileSync(fullPath, item.content, 'utf8');
+      }
+      this.run(repoPath, ['add', '--', ...paths]);
+      if (this.check(repoPath, ['diff', '--cached', '--quiet', '--', ...paths])) {
+        throw new Error('No changes to commit: pushed files are identical to the repository');
+      }
+      return this.commit(repoPath, msg, author, paths);
+    } catch (err) {
+      this.check(repoPath, ['reset', '-q', '--', ...paths]);
+      for (const o of originals) {
+        if (o.content === null) fs.rmSync(o.fullPath, { force: true });
+        else fs.writeFileSync(o.fullPath, o.content);
+      }
+      throw err;
     }
-    return this.commit(repoPath, msg, author, paths);
+  }
+
+  /**
+   * Refuses paths that name a tracked file or folder with different letter case ('SRC/Auth/x.ts' vs 'src/auth/x.ts'):
+   * on a case-insensitive filesystem they would silently overwrite the tracked file.
+   */
+  static assertExactCase(repoPath: string, paths: string[]): void {
+    if (!this.hasCommits(repoPath)) return;
+    const known = new Map<string, string>();
+    for (const file of this.run(repoPath, ['ls-files', '-z']).split('\0').filter(Boolean)) {
+      const segments = file.split('/');
+      for (let i = 1; i <= segments.length; i++) {
+        const prefix = segments.slice(0, i).join('/');
+        known.set(prefix.toLowerCase(), prefix);
+      }
+    }
+    for (const p of paths) {
+      const segments = p.split('/');
+      for (let i = 1; i <= segments.length; i++) {
+        const prefix = segments.slice(0, i).join('/');
+        const existing = known.get(prefix.toLowerCase());
+        if (existing !== undefined && existing !== prefix) {
+          throw new Error(`'${p}' differs only in letter case from '${existing}' in the repository; use the exact name`);
+        }
+      }
+    }
   }
 
   /**
@@ -326,6 +367,35 @@ export class GitHost {
 
   static getCommitAuthorEmail(repoPath: string, sha: string): string {
     return this.run(repoPath, ['show', '-s', '--format=%ae', sha]).trim();
+  }
+
+  /**
+   * Paths a commit adds, changes or deletes (the root commit is compared with the empty tree).
+   * For a merge (-c) only paths that match none of its parents: what the merge itself introduced.
+   * Changes merged in from another branch belong to that branch's commits.
+   */
+  static getCommitFiles(repoPath: string, sha: string): string[] {
+    return this.run(repoPath, ['diff-tree', '--no-commit-id', '--name-only', '-r', '--root', '-c', sha])
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+  }
+
+  /** Commits reachable from sha but not from base (newest first), or just sha when there is no base. */
+  static getCommitsSince(repoPath: string, base: string | null, sha: string, limit: number = 500): string[] {
+    if (!base || !this.resolveCommit(repoPath, base)) return [sha];
+    return this.run(repoPath, ['rev-list', `--max-count=${limit}`, `${base}..${sha}`])
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+  }
+
+  static getBranchHead(repoPath: string, branch: string): string | null {
+    try {
+      return this.run(repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]).trim() || null;
+    } catch {
+      return null;
+    }
   }
 
   static getCommitTime(repoPath: string, sha: string): number {

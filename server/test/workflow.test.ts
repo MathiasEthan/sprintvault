@@ -260,7 +260,7 @@ async function runTests() {
   expectReject(
     () => WorkflowService.pushWork(lockA.taskId, dev1Id, [{ path: 'README.md', content: fs.readFileSync(path.join(repoPath, 'README.md'), 'utf8') }], 'noop'),
     'rejectPush',
-    /No changes to commit/
+    /outside this task's scope/
   );
   const pushRes = WorkflowService.pushWork(lockA.taskId, dev1Id, [{ path: 'lib/core/index.ts', content: 'export {};\n' }], 'feat: core\n\nmulti-line body | with pipe');
   const pushedFiles = git(repoPath, 'show', '--name-only', '--format=', pushRes.sha);
@@ -344,6 +344,229 @@ async function runTests() {
   assert.throws(() => WorkflowService.createProject('Broken', 'git://local/x.git', 'bad branch..', leadId, []), /not a valid branch name/);
   assert.strictEqual(Project.findAll().length, projectCount, 'Failed creation leaves no project row');
   console.log('  ✔ Dashboard shape consistent; import is non-destructive; failed creation rolls back');
+
+  // Test 18: Scope enforcement, stale locks and governance metrics
+  console.log('▶ Test 18: Scope enforcement, stale lock release, metrics');
+  const { GovernanceEvent } = await import('../src/models/GovernanceEvent');
+  const { GovernanceKind } = await import('../src/types');
+  const scoped = WorkflowService.createTask(project.projectId, 'Auth fix', ['src/auth/'], leadId);
+  WorkflowService.assignTask(scoped.taskId, dev1Id, leadId);
+  WorkflowService.startWork(scoped.taskId, dev1Id);
+  expectReject(
+    () => WorkflowService.pushWork(scoped.taskId, dev1Id, [{ path: 'src/auth/auth.ts', content: fs.readFileSync(path.join(repoPath, 'src', 'auth', 'auth.ts'), 'utf8') }], 'noop'),
+    'rejectPush',
+    /No changes to commit/
+  );
+  const headBefore = git(repoPath, 'rev-parse', 'HEAD');
+  expectReject(
+    () => WorkflowService.pushWork(scoped.taskId, dev1Id, [
+      { path: 'src/auth/auth.ts', content: 'export const ok = 1;\n' },
+      { path: 'src/payments/pay.ts', content: 'export const sneaky = 1;\n' },
+    ], 'feat: auth'),
+    'rejectPush',
+    /'src\/payments\/pay\.ts', outside this task's scope \(src\/auth\)/
+  );
+  assert.strictEqual(git(repoPath, 'rev-parse', 'HEAD'), headBefore, 'Rejected push leaves the repository untouched');
+  assert.strictEqual(Task.findById(scoped.taskId)?.status, TaskStatus.IN_PROGRESS, 'Task stays in progress');
+  // A scope directory is not a prefix match on names: src/authority is outside src/auth
+  expectReject(
+    () => WorkflowService.pushWork(scoped.taskId, dev1Id, [{ path: 'src/authority.ts', content: 'x\n' }], 'x'),
+    'rejectPush',
+    /outside this task's scope/
+  );
+  // Commit Done also checks the files of a commit made outside SprintVault
+  fs.mkdirSync(path.join(repoPath, 'src', 'payments'), { recursive: true });
+  fs.writeFileSync(path.join(repoPath, 'src', 'payments', 'pay.ts'), 'export const sneaky = 1;\n');
+  git(repoPath, 'add', 'src/payments/pay.ts');
+  git(repoPath, '-c', 'user.name=Alex', '-c', 'user.email=alex@sprintvault.com', 'commit', '-q', '-m', 'sneaky');
+  expectReject(() => WorkflowService.commitDone(scoped.taskId, dev1Id, git(repoPath, 'rev-parse', 'HEAD')), 'rejectPush', /outside this task's scope/);
+  const inScope = WorkflowService.pushWork(scoped.taskId, dev1Id, [{ path: 'src/auth/auth.ts', content: 'export const ok = 1;\n' }], 'feat: auth');
+  assert.strictEqual(git(repoPath, 'show', '--name-only', '--format=', inScope.sha), 'src/auth/auth.ts', 'In-scope push succeeds');
+
+  // Stale locks: backdate a lock beyond the threshold, then release it with a reason
+  process.env.STALE_LOCK_HOURS = '1';
+  assert.strictEqual(LockManager.staleAfterHours(), 1);
+  const idle = WorkflowService.createTask(project.projectId, 'Idle work', ['src/idle/'], leadId);
+  WorkflowService.assignTask(idle.taskId, dev2Id, leadId);
+  WorkflowService.startWork(idle.taskId, dev2Id);
+  assert.strictEqual(LockManager.isStale(LockManager.lastActivity(idle.taskId)), false, 'A fresh lock is not stale');
+  const twoHoursAgo = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+  db.prepare("UPDATE file_locks SET acquired_at = ? WHERE task_id = ? AND status = 'ACTIVE'").run(twoHoursAgo, idle.taskId);
+  assert.strictEqual(LockManager.isStale(LockManager.lastActivity(idle.taskId)), true, 'Lock idle for 2h is stale at a 1h threshold');
+  assert.strictEqual(WorkflowService.getDashboard(leadId).activeLocks.find((l: any) => l.task_id === idle.taskId).is_stale, true);
+  // Downloading the task's project counts as activity
+  WorkflowService.pullCode(project.projectId, ['src/idle/'], dev2Id);
+  assert.strictEqual(LockManager.isStale(LockManager.lastActivity(idle.taskId)), false, 'A download refreshes the lock');
+  db.prepare("UPDATE activity_log SET created_at = ? WHERE user_id = ? AND action = 'PULL'").run(twoHoursAgo, dev2Id);
+  assert.throws(() => WorkflowService.forceRelease(idle.taskId, dev1Id, 'x'), /access denied/, 'Only the team lead can release');
+  assert.deepStrictEqual(WorkflowService.forceRelease(idle.taskId, leadId, 'Priya is on leave'), { stale: true });
+  assert.strictEqual(Task.findById(idle.taskId)?.status, TaskStatus.ASSIGNED);
+  const staleEvent = GovernanceEvent.recent(null, 1)[0];
+  assert.strictEqual(staleEvent.kind, GovernanceKind.STALE_RELEASE);
+  assert.match(staleEvent.detail, /^Priya is on leave \(no activity since /);
+  delete process.env.STALE_LOCK_HOURS;
+
+  // Metrics count what the rules stopped
+  const metrics = WorkflowService.getDashboard(leadId).metrics;
+  assert.strictEqual(metrics.conflictsPrevented, 2, 'Both overlapping starts (Tests 6 and 13) were recorded');
+  assert.strictEqual(metrics.scopeViolationsBlocked, 4, 'Test 14 README push plus three in this test');
+  assert.strictEqual(metrics.staleLocksReleased, 1);
+  assert.strictEqual(metrics.forceReleases, 2, 'Tests 11 and 12 released fresh locks');
+  assert.ok(metrics.completedThisWeek >= 5);
+  assert.ok(metrics.avgCycleHours !== null && metrics.avgCycleHours >= 0);
+  assert.strictEqual(metrics.staleAfterHours, 24, 'Default threshold is 24 hours');
+  const otherDev = developers[3].user_id;
+  assert.strictEqual(WorkflowService.getDashboard(otherDev).metrics.conflictsPrevented, 0, 'Developers only see metrics of their projects');
+  console.log('  ✔ Out-of-scope pushes and commits blocked; stale locks detected and released; metrics counted');
+
+  // Test 19: Bypass fixes from the end-to-end test pass
+  console.log('▶ Test 19: Merge/chain/author/case bypasses, failed-push cleanup, dedupe, stale notice, revocation');
+  const { ChangeFeed } = await import('../src/services/ChangeFeed');
+  const commitAs = (cwd: string, email: string, msg: string) =>
+    git(cwd, '-c', `user.name=${email.split('@')[0]}`, '-c', `user.email=${email}`, 'commit', '-q', '-m', msg);
+  const alexEmail = User.findById(dev1Id)!.email;
+  const priyaEmail = User.findById(dev2Id)!.email;
+  const startNew = (title: string, scope: string[], dev: number, projectId = project.projectId) => {
+    const t = WorkflowService.createTask(projectId, title, scope, leadId);
+    WorkflowService.assignTask(t.taskId, dev, leadId);
+    WorkflowService.startWork(t.taskId, dev);
+    return t;
+  };
+
+  // 1. A merge cannot hide an out-of-scope commit from the side branch
+  const mergeTask = startNew('Merge work', ['merge/'], dev1Id);
+  git(repoPath, 'checkout', '-q', '-b', 'side');
+  fs.writeFileSync(path.join(repoPath, 'MERGED_OUT.txt'), 'x\n');
+  fs.mkdirSync(path.join(repoPath, 'merge'), { recursive: true });
+  fs.writeFileSync(path.join(repoPath, 'merge', 'a.ts'), 'a\n');
+  git(repoPath, 'add', 'MERGED_OUT.txt', 'merge/a.ts');
+  commitAs(repoPath, alexEmail, 'side work');
+  git(repoPath, 'checkout', '-q', 'main');
+  git(repoPath, '-c', `user.email=${alexEmail}`, '-c', 'user.name=alex', 'merge', '-q', '--no-ff', '-m', 'merge side', 'side');
+  git(repoPath, 'branch', '-q', '-D', 'side');
+  expectReject(() => WorkflowService.commitDone(mergeTask.taskId, dev1Id, git(repoPath, 'rev-parse', 'HEAD')), 'rejectPush', /MERGED_OUT\.txt/);
+  git(repoPath, 'rm', '-q', 'MERGED_OUT.txt');
+  commitAs(repoPath, alexEmail, 'remove out-of-scope file');
+  expectReject(() => WorkflowService.commitDone(mergeTask.taskId, dev1Id, git(repoPath, 'rev-parse', 'HEAD')), 'rejectPush', /outside this task's scope/);
+  WorkflowService.forceRelease(mergeTask.taskId, leadId, 'cleanup');
+
+  // 4. Every commit since the lock is checked, not only the linked one
+  const chainTask = startNew('Chain work', ['chain/'], dev1Id);
+  fs.writeFileSync(path.join(repoPath, 'CHAIN_OUT.txt'), 'x\n');
+  git(repoPath, 'add', 'CHAIN_OUT.txt');
+  commitAs(repoPath, alexEmail, 'out of scope first');
+  fs.mkdirSync(path.join(repoPath, 'chain'), { recursive: true });
+  fs.writeFileSync(path.join(repoPath, 'chain', 'a.ts'), 'a\n');
+  git(repoPath, 'add', 'chain/a.ts');
+  commitAs(repoPath, alexEmail, 'clean last');
+  expectReject(() => WorkflowService.commitDone(chainTask.taskId, dev1Id, git(repoPath, 'rev-parse', 'HEAD')), 'rejectPush', /CHAIN_OUT\.txt/);
+  WorkflowService.forceRelease(chainTask.taskId, leadId, 'cleanup');
+  // Commits by other people and work under the developer's other locks are not held against the task
+  const mineTask = startNew('Mine', ['mine/'], dev1Id);
+  const alsoMine = startNew('Also mine', ['also/'], dev1Id);
+  fs.writeFileSync(path.join(repoPath, 'PRIYA.txt'), 'p\n');
+  git(repoPath, 'add', 'PRIYA.txt');
+  commitAs(repoPath, priyaEmail, 'priya elsewhere');
+  fs.mkdirSync(path.join(repoPath, 'also'), { recursive: true });
+  fs.writeFileSync(path.join(repoPath, 'also', 'b.ts'), 'b\n');
+  git(repoPath, 'add', 'also/b.ts');
+  commitAs(repoPath, alexEmail, 'other task of mine');
+  fs.mkdirSync(path.join(repoPath, 'mine'), { recursive: true });
+  fs.writeFileSync(path.join(repoPath, 'mine', 'a.ts'), 'a\n');
+  git(repoPath, 'add', 'mine/a.ts');
+  commitAs(repoPath, alexEmail, 'mine');
+  assert.strictEqual(WorkflowService.commitDone(mineTask.taskId, dev1Id, git(repoPath, 'rev-parse', 'HEAD')).status, TaskStatus.COMPLETED);
+  WorkflowService.forceRelease(alsoMine.taskId, leadId, 'cleanup');
+
+  // 5. The linked commit must be written by the developer
+  const authorTask = startNew('Author', ['author/'], dev1Id);
+  fs.mkdirSync(path.join(repoPath, 'author'), { recursive: true });
+  fs.writeFileSync(path.join(repoPath, 'author', 'a.ts'), 'a\n');
+  git(repoPath, 'add', 'author/a.ts');
+  commitAs(repoPath, priyaEmail, 'priya wrote this');
+  expectReject(() => WorkflowService.commitDone(authorTask.taskId, dev1Id, git(repoPath, 'rev-parse', 'HEAD')), 'rejectPush', /written by .*priya.*not by you/);
+  WorkflowService.forceRelease(authorTask.taskId, leadId, 'cleanup');
+
+  // 2. Paths that differ only in case are the same lock and cannot be pushed under another spelling
+  const caseA = startNew('Case lower', ['src/auth/'], dev1Id, otherProject.projectId);
+  const caseB = WorkflowService.createTask(otherProject.projectId, 'Case upper', ['SRC/Auth/'], leadId);
+  WorkflowService.assignTask(caseB.taskId, dev2Id, leadId);
+  expectReject(() => WorkflowService.startWork(caseB.taskId, dev2Id), 'rejectStart', /overlaps/);
+  const otherRepo = GitService.getProjectRepoPath(otherProject.projectId);
+  const authBefore = fs.readFileSync(path.join(otherRepo, 'src', 'auth', 'auth.ts'), 'utf8');
+  expectReject(
+    () => WorkflowService.pushWork(caseA.taskId, dev1Id, [{ path: 'SRC/Auth/auth.ts', content: 'overwrite\n' }], 'x'),
+    'rejectPush',
+    /differs only in letter case from 'src'/
+  );
+  assert.strictEqual(fs.readFileSync(path.join(otherRepo, 'src', 'auth', 'auth.ts'), 'utf8'), authBefore, 'Case variant did not touch the file');
+
+  // 3. A failed push restores the working tree
+  expectReject(
+    () => WorkflowService.pushWork(caseA.taskId, dev1Id, [
+      { path: 'src/auth/new.ts', content: 'new\n' },
+      { path: 'src/auth/auth.ts', content: authBefore },
+    ].slice(1), 'noop'),
+    'rejectPush',
+    /No changes/
+  );
+  fs.writeFileSync(path.join(otherRepo, 'src', 'auth', 'wip.ts'), 'untracked wip\n');
+  // A refusing pre-commit hook makes git commit fail after the files were written
+  const hookPath = path.join(otherRepo, '.git', 'hooks', 'pre-commit');
+  fs.writeFileSync(hookPath, '#!/bin/sh\necho "blocked by test hook" >&2\nexit 1\n', { mode: 0o755 });
+  try {
+    expectReject(
+      () => WorkflowService.pushWork(caseA.taskId, dev1Id, [
+        { path: 'src/auth/auth.ts', content: 'changed\n' },
+        { path: 'src/auth/brand-new.ts', content: 'new\n' },
+        { path: 'src/auth/wip.ts', content: 'overwritten\n' },
+      ], 'will fail'),
+      'rejectPush',
+      /Git commit and push failed/
+    );
+  } finally {
+    fs.unlinkSync(hookPath);
+  }
+  assert.strictEqual(fs.readFileSync(path.join(otherRepo, 'src', 'auth', 'auth.ts'), 'utf8'), authBefore, 'Tracked file restored');
+  assert.ok(!fs.existsSync(path.join(otherRepo, 'src', 'auth', 'brand-new.ts')), 'New file removed');
+  assert.strictEqual(fs.readFileSync(path.join(otherRepo, 'src', 'auth', 'wip.ts'), 'utf8'), 'untracked wip\n', 'Untracked file restored, not deleted');
+  fs.unlinkSync(path.join(otherRepo, 'src', 'auth', 'wip.ts'));
+  assert.strictEqual(git(otherRepo, 'status', '--porcelain'), '', 'Working tree clean after a failed push');
+
+  // 7. Retrying a blocked action counts once per blocking lock
+  const conflictsBefore = WorkflowService.getMetrics(null).conflictsPrevented;
+  for (let i = 0; i < 4; i++) {
+    try { WorkflowService.startWork(caseB.taskId, dev2Id); } catch { /* blocked */ }
+  }
+  assert.strictEqual(WorkflowService.getMetrics(null).conflictsPrevented, conflictsBefore, 'Repeated clicks are not new conflicts');
+  const scopeBefore = WorkflowService.getMetrics(null).scopeViolationsBlocked;
+  for (let i = 0; i < 3; i++) {
+    try { WorkflowService.pushWork(caseA.taskId, dev1Id, [{ path: 'README.md', content: 'x' }], 'x'); } catch { /* blocked */ }
+  }
+  assert.strictEqual(WorkflowService.getMetrics(null).scopeViolationsBlocked, scopeBefore + 1, 'Same out-of-scope push counts once');
+  WorkflowService.forceRelease(caseA.taskId, leadId, 'cleanup');
+  WorkflowService.startWork(caseA.taskId, dev1Id);
+  try { WorkflowService.startWork(caseB.taskId, dev2Id); } catch { /* blocked by the new lock */ }
+  assert.strictEqual(WorkflowService.getMetrics(null).conflictsPrevented, conflictsBefore + 1, 'A new blocking lock is a new conflict');
+
+  // 6. A lock turning stale bumps the change feed so open boards refresh
+  process.env.STALE_LOCK_HOURS = '1';
+  LockManager.noticeStaleLocks();
+  const feedBefore = ChangeFeed.current();
+  LockManager.noticeStaleLocks();
+  assert.strictEqual(ChangeFeed.current(), feedBefore, 'No bump while nothing changes');
+  db.prepare("UPDATE file_locks SET acquired_at = ? WHERE task_id = ? AND status = 'ACTIVE'").run(new Date(Date.now() - 2 * 3600 * 1000).toISOString(), caseA.taskId);
+  LockManager.noticeStaleLocks();
+  assert.ok(ChangeFeed.current() > feedBefore, 'Lock going stale bumps the feed');
+  delete process.env.STALE_LOCK_HOURS;
+
+  // 8. Logout revocation is stored in the database
+  const session = User.login('alex@sprintvault.com', 'password123')!;
+  const claims = JSON.parse(Buffer.from(session.token.split('.')[1], 'base64url').toString());
+  User.revokeToken(claims.jti, claims.exp);
+  assert.ok(db.prepare('SELECT 1 FROM revoked_tokens WHERE jti = ?').get(claims.jti), 'Revocation persisted');
+  assert.ok(User.isTokenRevoked(claims.jti));
+  console.log('  ✔ Merge, chained and foreign-author commits caught; case variants locked; failed pushes leave no trace; dedupe; stale notice; revocation persisted');
 
   // Clean up test DB & test repos
   db.close();
